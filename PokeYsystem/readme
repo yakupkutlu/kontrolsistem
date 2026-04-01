@@ -1,0 +1,12 @@
+# 1 Sanal ortam oluştur
+python -m venv venv
+
+# 2 Sanal ortamı aktifleştir
+# Windows:
+venv\Scripts\activate
+
+# 1. Gereksinimleri yükle
+pip install -r requirement.txt
+
+# 2. Programı çalıştır
+python monitoring.py
