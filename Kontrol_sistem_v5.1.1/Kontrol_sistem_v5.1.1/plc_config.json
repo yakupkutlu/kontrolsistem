@@ -1,0 +1,10 @@
+{
+  "ip": "192.168.0.1",
+  "rack": 0,
+  "slot": 2,
+  "ok_db": 600,
+  "ok_byte": 0,
+  "ok_bit": 0,
+  "poll_interval": 0.1,
+  "enabled": true
+}

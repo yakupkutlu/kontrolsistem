@@ -1,0 +1,94 @@
+Metadata-Version: 2.4
+Name: python-snap7
+Version: 3.0.0
+Summary: Pure Python S7 communication library for Siemens PLCs
+Author-email: Gijs Molenaar <gijsmolenaar@gmail.com>
+License: MIT
+Project-URL: Homepage, https://github.com/gijzelaerr/python-snap7
+Project-URL: Documentation, https://python-snap7.readthedocs.io/en/latest/
+Keywords: snap7,s7,siemens,plc
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Console
+Classifier: Topic :: System :: Hardware
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Manufacturing
+Classifier: Operating System :: POSIX
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Requires-Python: >=3.10
+Description-Content-Type: text/x-rst
+License-File: LICENSE
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+Requires-Dist: pytest-cov; extra == "test"
+Requires-Dist: pytest-html; extra == "test"
+Requires-Dist: mypy; extra == "test"
+Requires-Dist: types-setuptools; extra == "test"
+Requires-Dist: ruff; extra == "test"
+Requires-Dist: tox; extra == "test"
+Requires-Dist: tox-uv; extra == "test"
+Requires-Dist: types-click; extra == "test"
+Requires-Dist: uv; extra == "test"
+Provides-Extra: cli
+Requires-Dist: rich; extra == "cli"
+Requires-Dist: click; extra == "cli"
+Provides-Extra: doc
+Requires-Dist: sphinx; extra == "doc"
+Requires-Dist: sphinx_rtd_theme; extra == "doc"
+Dynamic: license-file
+
+About
+=====
+
+Python-snap7 is a pure Python S7 communication library for interfacing with Siemens S7 PLCs.
+
+The name "python-snap7" is historical — the library originally started as a Python wrapper
+around the `Snap7 <http://snap7.sourceforge.net/>`_ C library. As of version 3.0, the C
+library is no longer used, but the name is kept for backwards compatibility.
+
+Python-snap7 is tested with Python 3.10+, on Windows, Linux and OS X.
+
+The full documentation is available on `Read The Docs <https://python-snap7.readthedocs.io/en/latest/>`_.
+
+
+Version 3.0 - Pure Python Rewrite
+==================================
+
+Version 3.0 is a ground-up rewrite of python-snap7. The library no longer wraps the
+C snap7 shared library — instead, the entire S7 protocol stack (TPKT, COTP, and S7)
+is now implemented in pure Python. This is a **breaking change** from all previous
+versions.
+
+**Why this matters:**
+
+* **Portability**: No more platform-specific shared libraries (`.dll`, `.so`, `.dylib`).
+  python-snap7 now works on any platform that runs Python — including ARM, Alpine Linux,
+  and other environments where the C library was difficult or impossible to install.
+* **Easier installation**: Just ``pip install python-snap7``. No native dependencies,
+  no compiler toolchains, no manual library setup.
+* **Easier to extend**: New features and protocol support can be added directly in Python.
+
+**If you experience issues with 3.0:**
+
+1. Please report them on the `issue tracker <https://github.com/gijzelaerr/python-snap7/issues>`_
+   with a clear description of the problem and the version you are using
+   (``python -c "import snap7; print(snap7.__version__)"``).
+2. As a workaround, you can pin to the last pre-3.0 release::
+
+       $ pip install "python-snap7<3"
+
+   The latest stable pre-3.0 release is version 2.1.0. Documentation for pre-3.0
+   versions is available at `Read The Docs <https://python-snap7.readthedocs.io/en/v2/>`_.
+
+
+Installation
+============
+
+Install using pip::
+
+   $ pip install python-snap7
+
+No native libraries or platform-specific dependencies are required — python-snap7 is a pure Python package that works on all platforms.

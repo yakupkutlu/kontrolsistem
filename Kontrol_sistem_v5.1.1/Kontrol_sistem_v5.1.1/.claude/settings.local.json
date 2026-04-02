@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import snap7; print\\(''snap7 mevcut:'', snap7.__version__\\)\")",
+      "Bash(pip install:*)"
+    ]
+  }
+}

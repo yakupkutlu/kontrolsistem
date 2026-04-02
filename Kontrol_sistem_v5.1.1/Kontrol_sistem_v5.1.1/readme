@@ -1,0 +1,75 @@
+# Üretim Kamera İzleme Sistemi – Kurulum Rehberi
+
+## Endüstriyel PC'ye İlk Kurulum
+
+### 1. Python Kur
+- https://www.python.org/downloads/ adresinden Python 3.11 indir
+- Kurulum sırasında "Add Python to PATH" kutusunu mutlaka işaretle
+
+### 2. Proje Klasörünü Kopyala
+Tüm proje klasörünü (Kontrol_sistem_v5.1.1) PC'ye kopyala.
+USB, ağ paylaşımı veya harici disk ile taşınabilir.
+
+### 3. Kurulumu Çalıştır
+Proje klasörü içindeki kurulum.bat dosyasına çift tıkla.
+Bu işlem otomatik olarak:
+- Sanal ortam (venv) oluşturur
+- Tüm gerekli paketleri yükler (opencv, snap7, scikit-learn vb.)
+- İnternet bağlantısı gerektirir (ilk kurulumda)
+
+### 4. Programı Başlat
+Kurulum tamamlandıktan sonra proje.bat dosyasına çift tıkla.
+Sonraki kullanımlarda hep proje.bat ile aç.
+
+---
+
+## PLC Bağlantısı (Siemens S7 / ET 200S)
+
+1. Programı aç
+2. Ana menüden "PLC Ayarları" butonuna bas
+3. "PLC Entegrasyonunu Etkinleştir" kutusunu işaretle
+4. PLC IP adresini gir (örnek: 192.168.0.1)
+5. Rack: 0, Slot: 1 (ET 200S IM 151-8 PN/DP için)
+6. Yazma OK bölümüne DB No / Byte / Bit adresini gir
+7. "Bağlantıyı Test Et" butonuna bas
+8. "Kaydet ve Kapat" ile ayarları kaydet
+
+PLC sinyal mantığı:
+- Tüm ROI bölgeleri OK ise  →  DB600.DBX0.2 = 1
+- Herhangi bir ROI NOK ise  →  DB600.DBX0.2 = 0
+- İzleme durdurulduğunda   →  DB600.DBX0.2 = 0
+
+---
+
+## Proje Oluşturma ve Kontrol
+
+1. "Yeni Proje Oluştur" ile proje oluştur
+2. Kamera seç, referans görüntü çek
+3. ROI bölgelerini çiz (kontrol edilecek alanlar)
+4. Algoritma seç ve eşik değerini ayarla
+5. "Kontrole Başla" ile izlemeyi başlat
+
+---
+
+## Sorun Giderme
+
+Program açılmıyorsa:
+- proje.bat dosyasını Not Defteri ile aç
+- cd satırındaki klasör yolunun doğru olduğunu kontrol et
+
+snap7 hatası alınıyorsa:
+- kurulum.bat dosyasını tekrar çalıştır
+- İnternet bağlantısını kontrol et
+
+Kamera görünmüyorsa:
+- USB kamera için farklı Kamera numarası dene (0, 1, 2...)
+- IP kamera için kamera IP adresini ve port numarasını kontrol et
+
+---
+
+## Gereksinimler
+
+- Windows 10 / 11 (64-bit)
+- Python 3.11
+- İnternet bağlantısı (yalnızca ilk kurulumda)
+- Siemens S7 uyumlu PLC (snap7 protokolü)

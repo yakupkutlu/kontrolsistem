@@ -1,0 +1,11 @@
+numpy<2.0.0
+opencv-contrib-python
+Pillow
+PyWavelets
+scipy
+requests
+matplotlib
+scikit-image
+scikit-learn
+python-snap7
+joblib
