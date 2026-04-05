@@ -5,6 +5,9 @@
   "ok_db": 600,
   "ok_byte": 0,
   "ok_bit": 0,
+  "trigger_db": 600,
+  "trigger_byte": 0,
+  "trigger_bit": 1,
   "poll_interval": 0.1,
   "enabled": true
 }

@@ -197,6 +197,9 @@ class PLCManager:
         "ok_db": 600,
         "ok_byte": 0,
         "ok_bit": 0,
+        "trigger_db": 600,
+        "trigger_byte": 0,
+        "trigger_bit": 1,
         "poll_interval": 0.10,
         "enabled": False,
     }
@@ -206,6 +209,7 @@ class PLCManager:
         self.client = None
         self.connected = False
         self.config = dict(self.DEFAULT_CONFIG)
+        self._lock = threading.Lock()   # snap7 thread-safe değil
         self._load_config()
 
     # ── Config ────────────────────────────────────────────────────────────────
@@ -276,16 +280,17 @@ class PLCManager:
         """DB bloğuna tek bit yaz. (success: bool, message: str)"""
         if not SNAP7_AVAILABLE:
             return False, "snap7 yüklü değil"
-        if not self.ensure_connected():
-            return False, "PLC bağlantısı kurulamadı"
-        try:
-            data = self.client.db_read(db, byte_offset, 1)
-            set_bool(data, 0, bit_offset, value)
-            self.client.db_write(db, byte_offset, data)
-            return True, f"DB{db}.DBX{byte_offset}.{bit_offset} = {int(value)}"
-        except Exception as e:
-            self.connected = False
-            return False, f"Yazma hatası: {e}"
+        with self._lock:
+            if not self.ensure_connected():
+                return False, "PLC bağlantısı kurulamadı"
+            try:
+                data = self.client.db_read(db, byte_offset, 1)
+                set_bool(data, 0, bit_offset, value)
+                self.client.db_write(db, byte_offset, data)
+                return True, f"DB{db}.DBX{byte_offset}.{bit_offset} = {int(value)}"
+            except Exception as e:
+                self.connected = False
+                return False, f"Yazma hatası: {e}"
 
     def write_ok_signal(self, value: bool) -> tuple:
         """OK sinyalini yaz."""
@@ -294,6 +299,30 @@ class PLCManager:
             self.config["ok_byte"],
             self.config["ok_bit"],
             value,
+        )
+
+    # ── Bit Oku ───────────────────────────────────────────────────────────────
+    def read_bit(self, db: int, byte_offset: int, bit_offset: int) -> tuple:
+        """DB bloğundan tek bit oku. (success: bool, value: bool, message: str)"""
+        if not SNAP7_AVAILABLE:
+            return False, False, "snap7 yüklü değil"
+        with self._lock:
+            if not self.ensure_connected():
+                return False, False, "PLC bağlantısı kurulamadı"
+            try:
+                data = self.client.db_read(db, byte_offset, 1)
+                value = get_bool(data, 0, bit_offset)
+                return True, bool(value), f"DB{db}.DBX{byte_offset}.{bit_offset} = {int(value)}"
+            except Exception as e:
+                self.connected = False
+                return False, False, f"Okuma hatası: {e}"
+
+    def read_trigger(self) -> tuple:
+        """Trigger bitini oku. (success: bool, value: bool, message: str)"""
+        return self.read_bit(
+            self.config["trigger_db"],
+            self.config["trigger_byte"],
+            self.config["trigger_bit"],
         )
 
 
@@ -344,6 +373,36 @@ class ProductionMonitoringSystem:
         self._zoom_oy = None   # Fare merkezli zoom y offset (None = ortala)
         # PLC yöneticisi
         self.plc = PLCManager()
+        # İzleme döngü aralığı (ms) – ayarlar ekranından değiştirilebilir
+        self.monitor_interval = 1000
+        # PLC etkinse uygulama açılışında otomatik bağlan
+        if self.plc.config.get("enabled", False):
+            def _auto_plc():
+                import time; time.sleep(0.8)
+                self.plc.connect()
+            threading.Thread(target=_auto_plc, daemon=True).start()
+        # Algoritma seçenekleri – tüm ekranlardan erişilebilir
+        self.algo_options_map = {
+            "Basit SSIM (Standart)": "SSIM",
+            "Industrial IV3 AI": "INDUSTRIAL_AI",
+            "Advanced IV3 Engine": "ADVANCED_ENGINE",
+            "SIFT Hizalama + SSIM": "ALIGN_SSIM",
+            "Template Matching": "TEMPLATE",
+            "Histogram Karşılaştırma": "HISTOGRAM",
+            "Fourier Dönüşümü": "FOURIER",
+            "Wavelet Dönüşümü": "WAVELET",
+            "Brute-Force ORB": "ORB",
+            "ML model (HOG-SVM)": "ML_MODEL",
+            "ML model (SIFT-SVM)": "ML_MODEL_SIFT",
+            "DAISY -SVM": "ML_MODEL_DAISY",
+            "Haar-like -SVM": "ML_MODEL_HAAR",
+            "CENSURE -SVM": "ML_MODEL_CENSURE",
+            "Multi-Block LBP -SVM": "ML_MODEL_MBLBP",
+            "GLCM -SVM": "ML_MODEL_GLCM",
+            "LBP -SVM": "ML_MODEL_LBP",
+            "Gabor -SVM": "ML_MODEL_GABOR",
+            "Fisher Vector -SVM": "ML_MODEL_FISHER",
+        }
 
         # Ana menüyü göster
         self.show_main_menu()
@@ -551,21 +610,30 @@ class ProductionMonitoringSystem:
     def _cam_reader_loop(self, source):
         """Arka planda sürekli frame okuyan döngü (thread içinde çalışır)."""
         import time
+        _retry_count = 0
+
         if isinstance(source, str):
             cap = cv2.VideoCapture(source)          # IP/URL → FFmpeg
         else:
             cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)  # USB
 
+        if not cap.isOpened():
+            print(f"[UYARI] Kamera açılamadı: {source}")
+
         while self._cam_reader_active:
             if not cap.isOpened():
-                # Bağlantı kesildiyse yeniden dene
-                time.sleep(1)
+                # Bağlantı kesildiyse yeniden dene (en fazla 60 saniye bekle)
+                _retry_count += 1
+                wait = min(5.0, 1.0 + _retry_count * 0.5)
+                time.sleep(wait)
+                print(f"[BİLGİ] Kamera yeniden deneniyor ({_retry_count}): {source}")
                 if isinstance(source, str):
                     cap = cv2.VideoCapture(source)
                 else:
                     cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
                 continue
 
+            _retry_count = 0
             ret, frame = cap.read()
             if ret:
                 with self._cam_reader_lock:
@@ -638,6 +706,14 @@ class ProductionMonitoringSystem:
         )
         settings_btn.pack(pady=(12, 0), fill='x')
 
+        manage_btn = ttk.Button(
+            button_frame,
+            text="📋  Projeleri Yönet",
+            style="Ghost.TButton",
+            command=self.project_management_screen
+        )
+        manage_btn.pack(pady=(8, 0), fill='x')
+
         plc_btn = ttk.Button(
             button_frame,
             text="🔌  PLC Ayarları",
@@ -647,13 +723,137 @@ class ProductionMonitoringSystem:
         plc_btn.pack(pady=(8, 0), fill='x')
     
     # ─────────────────────────────────────────────────────────────────────────
+    # Proje Yönetimi Ekranı
+    # ─────────────────────────────────────────────────────────────────────────
+    def project_management_screen(self):
+        """Projeleri listele, sil veya yeniden adlandır."""
+        win = tk.Toplevel(self.root)
+        win.title("Proje Yönetimi")
+        win.geometry("560x480")
+        win.configure(bg="#0f172a")
+        win.grab_set()
+
+        tk.Label(win, text="Proje Yönetimi",
+                 bg="#0f172a", fg="#e5e7eb",
+                 font=("Segoe UI", 14, "bold")).pack(pady=(18, 8))
+
+        # Liste kutusu
+        frame = tk.Frame(win, bg="#0f172a")
+        frame.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.pack(side="right", fill="y")
+
+        lb = tk.Listbox(frame,
+                        bg="#1e293b", fg="#e5e7eb",
+                        font=("Segoe UI", 11),
+                        selectbackground="#2563eb",
+                        activestyle="none",
+                        yscrollcommand=scrollbar.set)
+        lb.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=lb.yview)
+
+        # Proje verisi
+        projects = []
+
+        def _load_projects():
+            lb.delete(0, tk.END)
+            projects.clear()
+            self.cursor.execute(
+                "SELECT id, name, created_date FROM projects ORDER BY created_date DESC"
+            )
+            for row in self.cursor.fetchall():
+                projects.append({'id': row[0], 'name': row[1], 'created': row[2]})
+                date_str = (row[2] or '')[:10]
+                lb.insert(tk.END, f"  {row[1]}   [{date_str}]")
+
+        _load_projects()
+
+        # Çift tıklama ile seç (hızlı erişim için)
+        lb.bind("<Double-Button-1>", lambda _: _rename())
+
+        # ── Buton satırı ─────────────────────────────────────────────────────
+        btn_row = tk.Frame(win, bg="#0f172a")
+        btn_row.pack(fill="x", padx=20, pady=(0, 16))
+
+        def _get_selected():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("Uyarı", "Lütfen bir proje seçin!", parent=win)
+                return None
+            return projects[sel[0]]
+
+        def _rename():
+            proj = _get_selected()
+            if proj is None:
+                return
+            new_name = simpledialog.askstring(
+                "Yeniden Adlandır",
+                f"'{proj['name']}' için yeni isim:",
+                initialvalue=proj['name'],
+                parent=win
+            )
+            if not new_name or new_name.strip() == proj['name']:
+                return
+            new_name = new_name.strip()
+            try:
+                self.cursor.execute(
+                    "UPDATE projects SET name=?, updated_date=? WHERE id=?",
+                    (new_name, datetime.datetime.now().isoformat(), proj['id'])
+                )
+                self.conn.commit()
+                _load_projects()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Hata", f"'{new_name}' adında bir proje zaten var!", parent=win)
+            except Exception as e:
+                messagebox.showerror("Hata", str(e), parent=win)
+
+        def _delete():
+            proj = _get_selected()
+            if proj is None:
+                return
+            if not messagebox.askyesno(
+                "Sil",
+                f"'{proj['name']}' projesi kalıcı olarak silinsin mi?\n"
+                "(ROI görüntüleri ve ML modelleri silinmez.)",
+                parent=win
+            ):
+                return
+            try:
+                self.cursor.execute("DELETE FROM monitoring_logs WHERE project_id=?", (proj['id'],))
+                self.cursor.execute("DELETE FROM roi_ml_models WHERE project_id=?", (proj['id'],))
+                self.cursor.execute("DELETE FROM projects WHERE id=?", (proj['id'],))
+                self.conn.commit()
+                _load_projects()
+            except Exception as e:
+                messagebox.showerror("Hata", str(e), parent=win)
+
+        tk.Button(btn_row, text="✏  Yeniden Adlandır",
+                  bg="#2563eb", fg="white",
+                  font=("Segoe UI", 10, "bold"),
+                  bd=0, padx=10, pady=8,
+                  command=_rename).pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        tk.Button(btn_row, text="🗑  Sil",
+                  bg="#dc2626", fg="white",
+                  font=("Segoe UI", 10, "bold"),
+                  bd=0, padx=10, pady=8,
+                  command=_delete).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        tk.Button(win, text="Kapat",
+                  bg="#374151", fg="white",
+                  font=("Segoe UI", 10),
+                  bd=0, padx=10, pady=8,
+                  command=win.destroy).pack(pady=(0, 12), padx=20, fill="x")
+
+    # ─────────────────────────────────────────────────────────────────────────
     # PLC Ayarları Ekranı
     # ─────────────────────────────────────────────────────────────────────────
     def plc_settings_screen(self):
         """PLC bağlantı ve sinyal ayarları penceresi."""
         win = tk.Toplevel(self.root)
         win.title("PLC Ayarları – Siemens S7")
-        win.geometry("480x680")
+        win.geometry("480x820")
         win.resizable(False, False)
         win.configure(bg="#0f172a")
         win.grab_set()
@@ -748,6 +948,49 @@ class ProductionMonitoringSystem:
                               font=("Segoe UI", 9, "italic"))
         ok_preview.pack(anchor="w")
 
+        # ── Trigger Okuma (Fotoğraf Çek Sinyali) ─────────────────────────────
+        s_trig = section(win, "Trigger Okuma  (PLC → fotoğraf çek sinyali)")
+
+        trig_db_var   = tk.IntVar(value=cfg.get("trigger_db", 600))
+        trig_byte_var = tk.IntVar(value=cfg.get("trigger_byte", 0))
+        trig_bit_var  = tk.IntVar(value=cfg.get("trigger_bit", 1))
+
+        trig_row = tk.Frame(s_trig, bg="#020617")
+        trig_row.pack(fill="x", pady=3)
+        for label, var, lo, hi in [
+            ("DB No:", trig_db_var, 1, 9999),
+            ("Byte:",  trig_byte_var, 0, 9999),
+            ("Bit:",   trig_bit_var,  0, 7),
+        ]:
+            tk.Label(trig_row, text=label, anchor="w",
+                     bg="#020617", fg="#e5e7eb",
+                     font=("Segoe UI", 10), width=7).pack(side="left")
+            tk.Spinbox(trig_row, from_=lo, to=hi, textvariable=var,
+                       **spin_cfg).pack(side="left", padx=(0, 8))
+
+        trig_preview = tk.Label(s_trig, text="", bg="#020617", fg="#f59e0b",
+                                font=("Segoe UI", 9, "italic"))
+        trig_preview.pack(anchor="w")
+
+        trig_test_lbl = tk.Label(s_trig, text="", bg="#020617",
+                                 font=("Segoe UI", 9), wraplength=420)
+        trig_test_lbl.pack(anchor="w", pady=(2, 0))
+
+        def _test_read_trigger():
+            _save_to_cfg()
+            trig_test_lbl.config(text="Okunuyor...", fg="#f59e0b")
+            def _do_read():
+                ok, val, msg = self.plc.read_trigger()
+                color = "#16a34a" if ok else "#dc2626"
+                win.after(0, lambda: trig_test_lbl.config(text=msg, fg=color))
+            threading.Thread(target=_do_read, daemon=True).start()
+
+        tk.Button(s_trig, text="🔍  Trigger Bitini Oku (Test)",
+                  bg="#0ea5e9", fg="white", activebackground="#0284c7",
+                  font=("Segoe UI", 10, "bold"),
+                  bd=0, padx=10, pady=6,
+                  command=_test_read_trigger).pack(fill="x", pady=(6, 0))
+
         # ── Okuma Hızı ───────────────────────────────────────────────────────
         s_speed = section(win, "Okuma Hızı")
         poll_var = tk.DoubleVar(value=cfg.get("poll_interval", 0.10))
@@ -761,10 +1004,13 @@ class ProductionMonitoringSystem:
             try:
                 ok_preview.config(
                     text=f"DB{ok_db_var.get()}.DBX{ok_byte_var.get()}.{ok_bit_var.get()}")
+                trig_preview.config(
+                    text=f"DB{trig_db_var.get()}.DBX{trig_byte_var.get()}.{trig_bit_var.get()}")
             except Exception:
                 pass
 
-        for v in (ok_db_var, ok_byte_var, ok_bit_var):
+        for v in (ok_db_var, ok_byte_var, ok_bit_var,
+                  trig_db_var, trig_byte_var, trig_bit_var):
             v.trace_add("write", _update_previews)
         _update_previews()
 
@@ -888,6 +1134,9 @@ class ProductionMonitoringSystem:
                 cfg["ok_db"]         = _safe_int(ok_db_var, 600)
                 cfg["ok_byte"]       = _safe_int(ok_byte_var, 0)
                 cfg["ok_bit"]        = _safe_int(ok_bit_var, 0)
+                cfg["trigger_db"]    = _safe_int(trig_db_var, 600)
+                cfg["trigger_byte"]  = _safe_int(trig_byte_var, 0)
+                cfg["trigger_bit"]   = _safe_int(trig_bit_var, 1)
                 cfg["poll_interval"] = _safe_float(poll_var, 0.1)
                 self.plc.save_config()
             except Exception as e:
@@ -895,11 +1144,25 @@ class ProductionMonitoringSystem:
 
         def _save_close():
             _save_to_cfg()
-            win.destroy()
+            if cfg.get("enabled", False):
+                status_lbl.config(text="Bağlanıyor...", fg="#f59e0b")
+                def _do_connect():
+                    ok, msg = self.plc.connect()
+                    try:
+                        win.after(0, lambda: status_lbl.config(
+                            text=f"{'✅' if ok else '❌'} {msg}",
+                            fg="#16a34a" if ok else "#dc2626"))
+                        win.after(1800, win.destroy)
+                    except Exception:
+                        pass
+                threading.Thread(target=_do_connect, daemon=True).start()
+            else:
+                self.plc.disconnect()
+                win.destroy()
 
         btn_bar = tk.Frame(win, bg="#0f172a")
         btn_bar.pack(fill="x", padx=16, pady=(10, 16))
-        tk.Button(btn_bar, text="Kaydet ve Kapat",
+        tk.Button(btn_bar, text="💾 Kaydet ve Bağlan",
                   bg="#2563eb", fg="white", activebackground="#1d4ed8",
                   font=("Segoe UI", 11, "bold"),
                   bd=0, padx=12, pady=8,
@@ -1101,8 +1364,16 @@ class ProductionMonitoringSystem:
         left_panel.pack(side='left', fill='y', padx=(10,5), pady=10)
         left_panel.pack_propagate(False)
 
+        # Proje Adı
+        ttk.Label(left_panel, text="Proje Adı", style="Section.TLabel").pack(pady=(14,4))
+        self._new_project_name_var = tk.StringVar()
+        tk.Entry(left_panel, textvariable=self._new_project_name_var,
+                 font=('Segoe UI', 11), bg='#1e293b', fg='#e5e7eb',
+                 insertbackground='white', relief='flat', bd=4
+                 ).pack(fill='x', padx=14, pady=(0,8))
+
         # Kamera Seçimi
-        ttk.Label(left_panel, text="Kamera Seçimi", style="Section.TLabel").pack(pady=(14,4))
+        ttk.Label(left_panel, text="Kamera Seçimi", style="Section.TLabel").pack(pady=(4,4))
 
         cam_row = ttk.Frame(left_panel, style="Card.TFrame")
         cam_row.pack(fill='x', padx=10)
@@ -1115,7 +1386,6 @@ class ProductionMonitoringSystem:
         def _scan_and_fill():
             cams = self.scan_cameras()
             self._cam_options = cams
-            print(cams)
             self.camera_combo['values'] = [c[1] for c in cams]
             if cams:
                 self.camera_combo.current(0)
@@ -1144,32 +1414,6 @@ class ProductionMonitoringSystem:
 
         # Ayırıcı
         tk.Frame(left_panel, bg='#1f2937', height=1).pack(fill='x', padx=10, pady=8)
-
-        # Algoritma Seçimi
-        ttk.Label(left_panel, text="Algoritma", style="Section.TLabel").pack(anchor='w', padx=14)
-
-        ALGO_OPTIONS = [
-            "Basit SSIM (Varsayılan)",
-            "Template Matching",
-            "Histogram Karşılaştırma",
-            "Fourier Dönüşümü",
-            "Wavelet Dönüşümü",
-            "Brute-Force ORB"
-        ]
-        self.algo_combo = ttk.Combobox(left_panel, values=ALGO_OPTIONS,
-                                       state='readonly', font=('Arial', 10))
-        self.algo_combo.current(0)
-        self.algo_combo.pack(fill='x', padx=14, pady=4)
-
-        thresh_row = ttk.Frame(left_panel, style="Card.TFrame")
-        thresh_row.pack(fill='x', padx=14, pady=(0,8))
-        ttk.Label(thresh_row, text="Eşik:", style="Muted.TLabel").pack(side='left')
-        self.threshold_var = tk.DoubleVar(value=0.75)
-        tk.Entry(thresh_row, textvariable=self.threshold_var, width=7,
-                 font=('Arial', 10)).pack(side='left', padx=6)
-
-        # Ayırıcı
-        tk.Frame(left_panel, bg='#1f2937', height=1).pack(fill='x', padx=10, pady=4)
 
         # ROI Listesi
         ttk.Label(left_panel, text="ROI Bölgeleri", style="Section.TLabel").pack(anchor='w', padx=14, pady=(6,2))
@@ -1214,20 +1458,192 @@ class ProductionMonitoringSystem:
         self.root.after(200, _scan_and_fill)
 
     def _refresh_roi_listbox(self):
-        """Sol paneldeki ROI listesini güncelle"""
+        """Sol paneldeki ROI listesini güncelle – OK/NOK kaydet + Eğit butonlarıyla."""
         for w in self.roi_listbox_frame.winfo_children():
             w.destroy()
+
         for idx, roi_item in enumerate(self.roi_list):
-            row = tk.Frame(self.roi_listbox_frame, bg='#020617')
-            row.pack(fill='x', pady=2, padx=2)
-            c = roi_item['color']
+            name  = roi_item['name']
+            color = roi_item['color']
             x, y, ww, hh = roi_item['coords']
-            tk.Label(row, text="●", fg=c, bg='#020617', font=('Arial', 12)).pack(side='left')
-            tk.Label(row, text=f"{roi_item['name']}  ({ww}×{hh})",
-                     bg='#020617', fg='#e5e7eb', font=('Segoe UI', 9), anchor='w').pack(side='left', expand=True, fill='x')
-            tk.Button(row, text="✕", fg='white', bg='#e74c3c',
+
+            # ─── Kart çerçevesi ───────────────────────────────────────────────
+            card = tk.Frame(self.roi_listbox_frame, bg='#1e293b',
+                            bd=0, relief='flat')
+            card.pack(fill='x', pady=3, padx=2)
+
+            # Başlık satırı: renk noktası + isim + boyut + sil
+            hdr = tk.Frame(card, bg='#1e293b')
+            hdr.pack(fill='x', padx=6, pady=(5, 2))
+            tk.Label(hdr, text="●", fg=color, bg='#1e293b',
+                     font=('Arial', 12)).pack(side='left')
+            tk.Label(hdr, text=f"{name}  ({ww}×{hh})",
+                     bg='#1e293b', fg='#e5e7eb',
+                     font=('Segoe UI', 9, 'bold'), anchor='w').pack(side='left', expand=True, fill='x')
+            tk.Button(hdr, text="✕", fg='white', bg='#e74c3c',
                       font=('Arial', 8, 'bold'), width=2, cursor='hand2',
+                      bd=0,
                       command=lambda i=idx: self._delete_roi(i)).pack(side='right')
+
+            # Görüntü sayacı
+            def _count(roi_name):
+                proj = getattr(self, '_new_project_name_var', None)
+                pname = proj.get().strip() if proj else ''
+                if not pname:
+                    return 0, 0
+                base = os.path.join('roi_images', self._safe_name(pname), self._safe_name(roi_name))
+                ok_n  = len([f for f in os.listdir(os.path.join(base,'OK'))
+                              if f.lower().endswith(('.jpg','.png'))]
+                             ) if os.path.isdir(os.path.join(base,'OK')) else 0
+                nok_n = len([f for f in os.listdir(os.path.join(base,'NOK'))
+                              if f.lower().endswith(('.jpg','.png'))]
+                             ) if os.path.isdir(os.path.join(base,'NOK')) else 0
+                return ok_n, nok_n
+
+            ok_n, nok_n = _count(name)
+            cnt_color = '#22c55e' if ok_n >= 5 and nok_n >= 5 else '#f59e0b'
+            cnt_lbl = tk.Label(card, text=f"  OK: {ok_n}  |  NOK: {nok_n}",
+                               bg='#1e293b', fg=cnt_color,
+                               font=('Segoe UI', 8))
+            cnt_lbl.pack(anchor='w', padx=6)
+
+            def _refresh_count(lbl, roi_name):
+                ok_n, nok_n = _count(roi_name)
+                c = '#22c55e' if ok_n >= 5 and nok_n >= 5 else '#f59e0b'
+                lbl.config(text=f"  OK: {ok_n}  |  NOK: {nok_n}", fg=c)
+
+            # OK / NOK kaydet butonları
+            def _capture_for_roi(roi_item_ref, label: str, count_lbl):
+                proj = getattr(self, '_new_project_name_var', None)
+                pname = proj.get().strip() if proj else ''
+                if not pname:
+                    messagebox.showwarning("Uyarı", "Önce proje adını girin!")
+                    return
+                # Anlık frame al
+                frame = None
+                cam_id = getattr(self, 'camera_var', None)
+                if cam_id is not None:
+                    source = self.get_camera_source(cam_id.get())
+                    if source == "HIKROBOT" and self.hik_camera:
+                        frame = self.hik_camera.get_frame()
+                    elif self._preview_active:
+                        # Canlı önizlemeden son frame'i al
+                        with self._cam_reader_lock:
+                            frame = self._cam_reader_frame.copy() if self._cam_reader_frame is not None else None
+                        if frame is None:
+                            # Direkt yakala
+                            if isinstance(source, int):
+                                cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+                            else:
+                                cap = cv2.VideoCapture(source)
+                            ret, frame = cap.read()
+                            cap.release()
+                            if not ret:
+                                frame = None
+
+                if frame is None and self.reference_image is not None:
+                    # Referans görüntüyü kullan (kamera yoksa)
+                    frame = cv2.cvtColor(self.reference_image, cv2.COLOR_RGB2BGR)
+
+                if frame is None:
+                    messagebox.showwarning("Uyarı", "Kamera görüntüsü alınamadı!")
+                    return
+
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h_img, w_img = frame_rgb.shape[:2]
+                rx, ry, rw, rh = roi_item_ref['coords']
+                rx = max(0, min(int(rx), w_img - 1))
+                ry = max(0, min(int(ry), h_img - 1))
+                rw = max(1, min(int(rw), w_img - rx))
+                rh = max(1, min(int(rh), h_img - ry))
+                crop = frame_rgb[ry:ry+rh, rx:rx+rw]
+                if crop.size == 0:
+                    messagebox.showwarning("Uyarı", "ROI bölgesi geçersiz!")
+                    return
+
+                sub = os.path.join('roi_images', self._safe_name(pname),
+                                   self._safe_name(roi_item_ref['name']), label)
+                os.makedirs(sub, exist_ok=True)
+                unique = int(datetime.datetime.now().timestamp() * 1000)
+                cv2.imwrite(os.path.join(sub, f"{self._safe_name(roi_item_ref['name'])}_{unique}.jpg"),
+                            cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+                _refresh_count(count_lbl, roi_item_ref['name'])
+
+            # Per-ROI algoritma seçimi
+            algo_row = tk.Frame(card, bg='#1e293b')
+            algo_row.pack(fill='x', padx=6, pady=(2, 0))
+            tk.Label(algo_row, text="Algoritma:", bg='#1e293b', fg='#9ca3af',
+                     font=('Segoe UI', 7)).pack(side='left')
+            _roi_algo_var = tk.StringVar()
+            # Önceden seçilmiş algoritma varsa göster
+            _saved_algo = roi_item.get('algorithm')
+            if _saved_algo:
+                for _dn, _in in self.algo_options_map.items():
+                    if _in == _saved_algo:
+                        _roi_algo_var.set(_dn)
+                        break
+            if not _roi_algo_var.get():
+                _roi_algo_var.set(list(self.algo_options_map.keys())[9])  # "ML model (HOG-SVM)"
+            _roi_algo_combo = ttk.Combobox(algo_row,
+                                           textvariable=_roi_algo_var,
+                                           values=list(self.algo_options_map.keys()),
+                                           state='readonly',
+                                           font=('Arial', 7),
+                                           width=22)
+            _roi_algo_combo.pack(side='left', padx=(4, 0), fill='x', expand=True)
+
+            def _on_roi_algo_change(event, ri=roi_item, var=_roi_algo_var):
+                ri['algorithm'] = self.algo_options_map.get(var.get())
+
+            _roi_algo_combo.bind('<<ComboboxSelected>>', _on_roi_algo_change)
+            # İlk değeri hemen uygula
+            roi_item['algorithm'] = self.algo_options_map.get(_roi_algo_var.get())
+
+            btn_row = tk.Frame(card, bg='#1e293b')
+            btn_row.pack(fill='x', padx=6, pady=(2, 2))
+            tk.Button(btn_row, text="✅ OK",
+                      bg='#16a34a', fg='white', font=('Segoe UI', 8, 'bold'),
+                      bd=0, padx=4, pady=3,
+                      command=lambda ri=roi_item, cl=cnt_lbl: _capture_for_roi(ri, 'OK', cl)
+                      ).pack(side='left', fill='x', expand=True, padx=(0,2))
+            tk.Button(btn_row, text="❌ NOK",
+                      bg='#dc2626', fg='white', font=('Segoe UI', 8, 'bold'),
+                      bd=0, padx=4, pady=3,
+                      command=lambda ri=roi_item, cl=cnt_lbl: _capture_for_roi(ri, 'NOK', cl)
+                      ).pack(side='left', fill='x', expand=True, padx=(2,2))
+
+            def _train_roi(roi_name, roi_ref):
+                proj = getattr(self, '_new_project_name_var', None)
+                pname = proj.get().strip() if proj else ''
+                if not pname:
+                    messagebox.showwarning("Uyarı", "Önce proje adını girin!")
+                    return
+                algo = roi_ref.get('algorithm') or 'ML_MODEL'
+                # Geçici current_project oluştur (DB'ye kaydedilmeden önce)
+                _prev = self.current_project
+                self.current_project = {
+                    'id': None,
+                    'name': pname,
+                    'algorithm': algo,
+                    'algo_threshold': 0.75,
+                    'roi_list': [{'name': r['name'], 'coords': r['coords'],
+                                  'algorithm': r.get('algorithm'), 'threshold': r.get('threshold')}
+                                 for r in self.roi_list],
+                    'roi': self.roi_list[0]['coords'] if self.roi_list else (0,0,1,1),
+                    'camera_id': getattr(self, 'camera_var', tk.IntVar()).get(),
+                }
+                self._train_single_roi(roi_name, algo)
+                self.current_project = _prev
+
+            tk.Button(btn_row, text="🧠 Eğit",
+                      bg='#7c3aed', fg='white', font=('Segoe UI', 8, 'bold'),
+                      bd=0, padx=4, pady=3,
+                      command=lambda rn=name, ri=roi_item: _train_roi(rn, ri)
+                      ).pack(side='left', fill='x', expand=True, padx=(2,0))
+
+            # Ince ayırıcı
+            tk.Frame(self.roi_listbox_frame, bg='#0f172a', height=1).pack(fill='x')
+
         if self.roi_list:
             self.save_btn.config(state='normal')
         else:
@@ -1407,7 +1823,10 @@ class ProductionMonitoringSystem:
             messagebox.showwarning("Uyarı", "Lütfen en az bir ROI bölgesi seçin!")
             return
 
-        project_name = simpledialog.askstring("Proje Adı", "Proje adını girin:")
+        project_name = getattr(self, '_new_project_name_var', None)
+        project_name = project_name.get().strip() if project_name else ''
+        if not project_name:
+            project_name = simpledialog.askstring("Proje Adı", "Proje adını girin:")
         if not project_name:
             return
 
@@ -1418,24 +1837,16 @@ class ProductionMonitoringSystem:
 
             roi_json = json.dumps([
                 {'name': r['name'], 'x': r['coords'][0], 'y': r['coords'][1],
-                 'w': r['coords'][2], 'h': r['coords'][3]}
+                 'w': r['coords'][2], 'h': r['coords'][3],
+                 'algorithm': r.get('algorithm') or None,
+                 'threshold': r.get('threshold') or None}
                 for r in self.roi_list
             ], ensure_ascii=False)
 
-            algo_map = {
-                "Basit SSIM (Varsayılan)": "SSIM",
-                "Template Matching": "TEMPLATE",
-                "Histogram Karşılaştırma": "HISTOGRAM",
-                "Fourier Dönüşümü": "FOURIER",
-                "Wavelet Dönüşümü": "WAVELET",
-                "Brute-Force ORB": "ORB"
-            }
-            algo_key = algo_map.get(
-                self.algo_combo.get() if hasattr(self, 'algo_combo') else "", "SSIM")
-            try:
-                thresh = float(self.threshold_var.get())
-            except Exception:
-                thresh = 0.75
+            # Proje varsayılan algoritması: ilk ROI'nin algoritması, yoksa SSIM
+            first_roi_algo = (self.roi_list[0].get('algorithm') if self.roi_list else None) or 'SSIM'
+            algo_key = first_roi_algo
+            thresh = 0.75
 
             first = self.roi_list[0]['coords']
 
@@ -1450,6 +1861,12 @@ class ProductionMonitoringSystem:
                   roi_json, algo_key, thresh, now, now))
 
             self.conn.commit()
+            new_project_id = self.cursor.lastrowid
+
+            # Proje oluşturma sırasında eğitilen modeller project_id=None ile
+            # diske kaydedilmişti — şimdi DB'ye bağla
+            self._register_pending_models(new_project_id, project_name)
+
             self.stop_live_preview()
             messagebox.showinfo("Başarılı", f"Proje '{project_name}' kaydedildi!")
             self.show_main_menu()
@@ -1459,6 +1876,59 @@ class ProductionMonitoringSystem:
         except Exception as e:
             messagebox.showerror("Hata", f"Kayıt hatası: {str(e)}")
 
+
+    def _register_pending_models(self, project_id: int, project_name: str):
+        """Proje oluşturma sırasında diske kaydedilen (project_id=None) modelleri
+        yeni proje ID'siyle DB'ye kaydet."""
+        safe_proj = self._safe_name(project_name)
+        # Her ROI için olası model dosyalarını tara
+        suffix_map = {
+            'SIFT_SVM':    'SIFT_SVM',
+            'DAISY_SVM':   'DAISY_SVM',
+            'HAAR_SVM':    'HAAR_SVM',
+            'CENSURE_SVM': 'CENSURE_SVM',
+            'MBLBP_SVM':   'MBLBP_SVM',
+            'GLCM_SVM':    'GLCM_SVM',
+            'LBP_SVM':     'LBP_SVM',
+            'GABOR_SVM':   'GABOR_SVM',
+            'FISHER_SVM':  'FISHER_SVM',
+            '':            'HOG_SVM',   # suffix yok → HOG
+        }
+        now = datetime.datetime.now().isoformat()
+        for roi_item in self.roi_list:
+            roi_name = roi_item['name']
+            safe_roi = self._safe_name(roi_name)
+            roi_folder = os.path.join('roi_images', safe_proj, roi_name)
+            if not os.path.isdir(roi_folder):
+                continue
+            for suffix, model_type_str in suffix_map.items():
+                fname = f"{safe_proj}_{safe_roi}_{suffix}.pkl" if suffix \
+                    else f"{safe_proj}_{safe_roi}.pkl"
+                model_path = os.path.join(roi_folder, fname)
+                if not os.path.exists(model_path):
+                    continue
+                try:
+                    gmm_path = None
+                    if model_type_str == 'FISHER_SVM':
+                        gp = os.path.join(roi_folder, f"{safe_proj}_{safe_roi}_FISHER_GMM.pkl")
+                        gmm_path = gp if os.path.exists(gp) else None
+                    params = {'model_type': model_type_str,
+                              'gmm_path': gmm_path} if gmm_path else {'model_type': model_type_str}
+                    self.cursor.execute('''
+                        INSERT INTO roi_ml_models
+                            (project_id, roi_name, model_type, model_path, params_json, created_date, updated_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(project_id, roi_name) DO UPDATE SET
+                            model_type=excluded.model_type,
+                            model_path=excluded.model_path,
+                            params_json=excluded.params_json,
+                            updated_date=excluded.updated_date
+                    ''', (project_id, roi_name, model_type_str, model_path,
+                          json.dumps(params), now, now))
+                    self.conn.commit()
+                    break  # Bu ROI için bir model bulundu, diğer suffix'lere gerek yok
+                except Exception as e:
+                    print(f"[UYARI] Model kaydı atlandı ({roi_name}/{suffix}): {e}")
 
     def settings_screen(self):
         """Ayarlar ekranı - Proje Seçimi"""
@@ -1511,8 +1981,15 @@ class ProductionMonitoringSystem:
         
         # Seçilen projeyi yükle
         project_id = [p[0] for p in projects if p[1] == selected_project.get()][0]
-        self.load_project(project_id)
-        self.start_settings()
+        try:
+            self.load_project(project_id)
+            self.start_settings()
+        except Exception as exc:
+            import traceback
+            detail = traceback.format_exc()
+            messagebox.showerror("Ayarlar Açılamadı",
+                                 f"{exc}\n\nDetay:\n{detail}")
+            self.show_main_menu()
 
     def start_settings(self):
         """Ayarlar ekranını başlat"""
@@ -1535,13 +2012,33 @@ class ProductionMonitoringSystem:
         ttk.Label(header_frame, text=f"Ayarlar: {self.current_project['name']}",
                   style="HeaderTitle.TLabel").pack(side='left', padx=20)
 
-        # Sol Panel (Kontroller)
-        left_panel = ttk.Frame(main_container, style="Card.TFrame", width=300)
-        left_panel.pack(side='left', fill='y', padx=5, pady=5)
-        left_panel.pack_propagate(False)
+        # Sol Panel (Kontroller) – kaydırılabilir
+        _lp_wrapper = tk.Frame(main_container, bg='#020617', width=310)
+        _lp_wrapper.pack(side='left', fill='y', padx=5, pady=5)
+        _lp_wrapper.pack_propagate(False)
+
+        _lp_canvas = tk.Canvas(_lp_wrapper, bg='#020617', highlightthickness=0)
+        _lp_scrollbar = tk.Scrollbar(_lp_wrapper, orient='vertical', command=_lp_canvas.yview)
+        _lp_canvas.configure(yscrollcommand=_lp_scrollbar.set)
+        _lp_scrollbar.pack(side='right', fill='y')
+        _lp_canvas.pack(side='left', fill='both', expand=True)
+
+        left_panel = tk.Frame(_lp_canvas, bg='#020617')
+        _lp_win_id = _lp_canvas.create_window((0, 0), window=left_panel, anchor='nw')
+
+        def _lp_on_configure(event):
+            _lp_canvas.configure(scrollregion=_lp_canvas.bbox('all'))
+        left_panel.bind('<Configure>', _lp_on_configure)
+        _lp_canvas.bind('<Configure>', lambda e: _lp_canvas.itemconfig(_lp_win_id, width=e.width))
+
+        def _lp_mousewheel(event):
+            _lp_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        _lp_canvas.bind('<MouseWheel>', _lp_mousewheel)
+        left_panel.bind('<MouseWheel>', _lp_mousewheel)
         
         # Yöntem Seçimi (Combobox)
-        ttk.Label(left_panel, text="Algoritma Seçimi", style="Section.TLabel").pack(pady=(10, 5))
+        tk.Label(left_panel, text="Algoritma Seçimi",
+                 font=('Segoe UI', 11, 'bold'), bg='#020617', fg='#e5e7eb').pack(pady=(10, 5))
         
         self.algo_options_map = {
             "Basit SSIM (Standart)": "SSIM",
@@ -1564,9 +2061,50 @@ class ProductionMonitoringSystem:
             "Gabor -SVM": "ML_MODEL_GABOR",
             "Fisher Vector -SVM": "ML_MODEL_FISHER",
         }
-        self.algo_combo_settings = ttk.Combobox(left_panel, values=list(self.algo_options_map.keys()), state='readonly', font=('Arial', 10))
-        
-        # Mevcut algoritmayı seç
+        # ── Proje Adı Değiştir ────────────────────────────────────────────────
+        tk.Frame(left_panel, bg='#1f2937', height=1).pack(fill='x', padx=10, pady=(0, 6))
+        tk.Label(left_panel, text="Proje Adı",
+                 font=('Segoe UI', 10, 'bold'), bg='#020617', fg='#e5e7eb').pack(anchor='w', padx=14)
+        _proj_name_var = tk.StringVar(value=self.current_project.get('name', ''))
+        _proj_name_entry = tk.Entry(left_panel, textvariable=_proj_name_var,
+                                    font=('Segoe UI', 10), bg='#1e293b', fg='#e5e7eb',
+                                    insertbackground='white', relief='flat', bd=4)
+        _proj_name_entry.pack(fill='x', padx=14, pady=(2, 0))
+
+        def _rename_project():
+            new_name = _proj_name_var.get().strip()
+            if not new_name:
+                messagebox.showwarning("Uyarı", "Proje adı boş olamaz!")
+                return
+            if new_name == self.current_project.get('name'):
+                return
+            try:
+                self.cursor.execute(
+                    'UPDATE projects SET name=?, updated_date=? WHERE id=?',
+                    (new_name, datetime.datetime.now().isoformat(), self.current_project['id'])
+                )
+                self.conn.commit()
+                self.current_project['name'] = new_name
+                messagebox.showinfo("Kaydedildi", f"Proje adı '{new_name}' olarak güncellendi.")
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Hata", "Bu isimde başka bir proje zaten var!")
+            except Exception as e:
+                messagebox.showerror("Hata", f"Kayıt hatası: {e}")
+
+        tk.Button(left_panel, text="✏ Adı Değiştir",
+                  bg='#7c3aed', fg='white', font=('Segoe UI', 9, 'bold'),
+                  bd=0, padx=8, pady=4,
+                  command=_rename_project).pack(anchor='e', padx=14, pady=(3, 6))
+
+        # ── Varsayılan Algoritma ──────────────────────────────────────────────
+        tk.Frame(left_panel, bg='#1f2937', height=1).pack(fill='x', padx=10, pady=(4, 6))
+        tk.Label(left_panel, text="Varsayılan Algoritma",
+                 font=('Segoe UI', 10, 'bold'), bg='#020617', fg='#e5e7eb').pack(anchor='w', padx=14)
+        tk.Label(left_panel, text="ROI bazlı algoritma seçilmemişse kullanılır",
+                 font=('Segoe UI', 8), bg='#020617', fg='#6b7280').pack(anchor='w', padx=14)
+
+        self.algo_combo_settings = ttk.Combobox(left_panel, values=list(self.algo_options_map.keys()),
+                                                state='readonly', font=('Arial', 10))
         current_algo = self.current_project.get('algorithm', 'SSIM')
         for display_name, internal_name in self.algo_options_map.items():
             if internal_name == current_algo:
@@ -1574,105 +2112,74 @@ class ProductionMonitoringSystem:
                 break
         else:
             self.algo_combo_settings.current(0)
-            
-        self.algo_combo_settings.pack(fill='x', padx=20, pady=5)
-        
-        # Eşik Değer Girişi
-        ttk.Label(left_panel, text="Eşik Değeri / Parametre", style="Section.TLabel").pack(pady=(20, 5))
-        
-        self.threshold_var = tk.DoubleVar(value=0.75)
-        entry_frame = ttk.Frame(left_panel, style="Card.TFrame")
-        entry_frame.pack(pady=5)
-        
-        tk.Entry(entry_frame, textvariable=self.threshold_var, width=10, font=('Arial', 12)).pack(side='left')
-        
-        # Ayarları Kaydet Butonu
+        self.algo_combo_settings.pack(fill='x', padx=14, pady=(4, 2))
+
+        _thresh_row = tk.Frame(left_panel, bg='#020617')
+        _thresh_row.pack(fill='x', padx=14, pady=(0, 4))
+        tk.Label(_thresh_row, text="Varsayılan Eşik:", bg='#020617', fg='#9ca3af',
+                 font=('Segoe UI', 9)).pack(side='left')
+        self.threshold_var = tk.DoubleVar(value=self.current_project.get('algo_threshold', 0.75))
+        tk.Entry(_thresh_row, textvariable=self.threshold_var, width=7,
+                 font=('Arial', 10), bg='#1e293b', fg='#e5e7eb',
+                 insertbackground='white', relief='flat').pack(side='left', padx=6)
+
+        # ── İzleme Hızı ───────────────────────────────────────────────────────
+        tk.Frame(left_panel, bg='#1f2937', height=1).pack(fill='x', padx=10, pady=(6, 4))
+        tk.Label(left_panel, text="İzleme Hızı (ms)",
+                 font=('Segoe UI', 10, 'bold'), bg='#020617', fg='#e5e7eb').pack(anchor='w', padx=14)
+        interval_frame = tk.Frame(left_panel, bg='#020617')
+        interval_frame.pack(pady=4, padx=14, fill='x')
+        self.interval_var = tk.IntVar(value=self.monitor_interval)
+        tk.Spinbox(interval_frame, from_=100, to=10000, increment=100,
+                   textvariable=self.interval_var, width=8,
+                   font=('Arial', 11),
+                   bg="#1e293b", fg="#e5e7eb",
+                   buttonbackground="#334155",
+                   relief="flat").pack(side='left')
+        tk.Label(interval_frame, text="ms  (min 100)",
+                 bg="#020617", fg="#9ca3af",
+                 font=("Segoe UI", 9)).pack(side='left', padx=6)
+
+        # ── Genel Ayarları Kaydet ─────────────────────────────────────────────
         def save_settings():
             try:
                 display_name = self.algo_combo_settings.get()
                 algo_internal = self.algo_options_map.get(display_name, "SSIM")
                 thresh = float(self.threshold_var.get())
-                
+
                 self.cursor.execute('''
-                    UPDATE projects 
+                    UPDATE projects
                     SET algorithm = ?, algo_threshold = ?, updated_date = ?
                     WHERE id = ?
                 ''', (algo_internal, thresh, datetime.datetime.now().isoformat(), self.current_project['id']))
                 self.conn.commit()
-                
-                # Bellekteki projeyi güncelle
                 self.current_project['algorithm'] = algo_internal
                 self.current_project['algo_threshold'] = thresh
-                
-                messagebox.showinfo("Başarılı", "Ayarlar kaydedildi!")
+
+                try:
+                    new_interval = int(self.interval_var.get())
+                    self.monitor_interval = max(100, new_interval)
+                except Exception:
+                    pass
+
+                messagebox.showinfo("Başarılı", "Genel ayarlar kaydedildi!")
             except Exception as e:
                 messagebox.showerror("Hata", f"Kaydetme hatası: {e}")
 
-        ttk.Button(left_panel, text="💾 Ayarları Kaydet", command=save_settings,
-                   style="Success.TButton").pack(pady=15, padx=20, fill='x')
+        ttk.Button(left_panel, text="💾 Genel Ayarları Kaydet", command=save_settings,
+                   style="Success.TButton").pack(pady=(8, 12), padx=14, fill='x')
 
-        # ML model eğitimi butonu (sadece ML_MODEL seçiliyken aktif)
-        def on_algo_change(event=None):
-            display = self.algo_combo_settings.get()
-            internal = self.algo_options_map.get(display, "SSIM")
-            state = 'normal' if internal in (
-                "ML_MODEL", "ML_MODEL_SIFT", "ML_MODEL_DAISY",
-                "ML_MODEL_HAAR", "ML_MODEL_CENSURE", "ML_MODEL_MBLBP",
-                "ML_MODEL_GLCM", "ML_MODEL_LBP", "ML_MODEL_GABOR",
-                "ML_MODEL_FISHER",
-            ) else 'disabled'
-            self.train_ml_btn.config(state=state)
-
-        self.algo_combo_settings.bind("<<ComboboxSelected>>", on_algo_change)
-
-        self.train_ml_btn = ttk.Button(
-            left_panel,
-            text="🧠 ML Model Eğit",
-            style="Primary.TButton",
-            command=self.train_ml_models,
-            state='disabled'
-        )
-        self.train_ml_btn.pack(pady=5, padx=20, fill='x')
-
-        # İlk açılışta doğru state ayarı
-        on_algo_change()
-
-        # Anlık Sonuç Göstergeleri
-        ttk.Label(left_panel, text="Test Sonuçları (Anlık)", style="Section.TLabel").pack(pady=(20, 5))
-        
-        self.score_label = tk.Label(left_panel, text="Skor: -", font=('Segoe UI', 11), bg='#020617', fg='#e5e7eb')
-        self.score_label.pack(pady=5)
-        
-        self.result_label = tk.Label(left_panel, text="DURUM: -", font=('Segoe UI', 14, 'bold'),
-                                     bg='#020617', fg='#e5e7eb')
-        self.result_label.pack(pady=10)
-        
-        self.detail_label = tk.Label(left_panel, text="", font=('Segoe UI', 9),
-                                     bg='#020617', fg='#9ca3af', wraplength=280)
-        self.detail_label.pack(pady=5)
-
-        # ROI label (OK / Not OK) seçimi
-        label_frame = ttk.LabelFrame(left_panel, text="ROI Etiketi", padding=(10, 5))
-        label_frame.pack(pady=(15, 5), padx=20, fill='x')
-
-        self.roi_label_var = tk.StringVar(value="")
-        tk.Radiobutton(label_frame, text="OK", variable=self.roi_label_var,
-                       value="OK", bg='#020617', fg='#e5e7eb',
-                       selectcolor='#020617', anchor='w').pack(fill='x')
-        tk.Radiobutton(label_frame, text="Not OK", variable=self.roi_label_var,
-                       value="NOK", bg='#020617', fg='#e5e7eb',
-                       selectcolor='#020617', anchor='w').pack(fill='x')
-
-        # ROI Kaydet butonu
-        preview_btn = ttk.Button(left_panel, text="👁 ROI kaydet",
-                                 style="Accent.TButton",
-                                 command=self.save_roi_image)
-        preview_btn.pack(pady=10, padx=20, fill='x')
-        self.preview_btn = preview_btn
+        # score/result/detail label'lar update_validation için gerekli (gizli)
+        self.score_label  = tk.Label(left_panel, text="", bg='#020617', fg='#020617')
+        self.result_label = tk.Label(left_panel, text="", bg='#020617', fg='#020617')
+        self.detail_label = tk.Label(left_panel, text="", bg='#020617', fg='#020617')
+        # ROI label var (eski save_roi_image uyumluluğu için tutuldu)
+        self.roi_label_var = tk.StringVar(value="OK")
 
         # ── ROI Yönetimi ──────────────────────────────────────────────────────
         tk.Frame(left_panel, bg='#1f2937', height=1).pack(fill='x', padx=10, pady=(10, 4))
-        ttk.Label(left_panel, text="ROI Bölgeleri", style="Section.TLabel").pack(anchor='w', padx=14)
+        tk.Label(left_panel, text="ROI Bölgeleri",
+                 font=('Segoe UI', 11, 'bold'), bg='#020617', fg='#e5e7eb').pack(anchor='w', padx=14)
 
         _roi_lb_outer = tk.Frame(left_panel, bg='#020617')
         _roi_lb_outer.pack(fill='x', padx=10, pady=2)
@@ -1680,7 +2187,8 @@ class ProductionMonitoringSystem:
         _roi_lb = tk.Listbox(
             _roi_lb_outer, bg='#1e293b', fg='#e5e7eb',
             font=('Segoe UI', 9), height=4,
-            selectbackground='#2563eb', activestyle='none'
+            selectbackground='#2563eb', activestyle='none',
+            exportselection=False
         )
         _roi_lb.pack(side='left', fill='x', expand=True)
         _roi_sb = tk.Scrollbar(_roi_lb_outer, command=_roi_lb.yview)
@@ -1697,6 +2205,61 @@ class ProductionMonitoringSystem:
 
         _roi_btn_row = tk.Frame(left_panel, bg='#020617')
         _roi_btn_row.pack(fill='x', padx=10, pady=2)
+
+        def _save_roi_list_to_db(roi_list):
+            """roi_list'i DB'ye yaz (algorithm + threshold dahil)."""
+            roi_json = json.dumps([
+                {'name': r['name'], 'x': r['coords'][0], 'y': r['coords'][1],
+                 'w': r['coords'][2], 'h': r['coords'][3],
+                 'algorithm': r.get('algorithm') or None,
+                 'threshold': r.get('threshold') or None}
+                for r in roi_list
+            ], ensure_ascii=False)
+            self.cursor.execute(
+                'UPDATE projects SET roi_list=?, updated_date=? WHERE id=?',
+                (roi_json, datetime.datetime.now().isoformat(), self.current_project['id'])
+            )
+            self.conn.commit()
+
+        def _rename_roi_from_settings():
+            sel = _roi_lb.curselection()
+            if not sel:
+                messagebox.showwarning("Uyarı", "Yeniden adlandırılacak ROI'yi seçin!")
+                return
+            idx = sel[0]
+            roi_list = self.current_project.get('roi_list', [])
+            if idx >= len(roi_list):
+                return
+            old_name = roi_list[idx]['name']
+            new_name = simpledialog.askstring(
+                "ROI Yeniden Adlandır",
+                f"'{old_name}' için yeni isim:",
+                initialvalue=old_name
+            )
+            if not new_name or new_name.strip() == old_name:
+                return
+            new_name = new_name.strip()
+            # Aynı isim başka ROI'de var mı?
+            if any(r['name'] == new_name for i, r in enumerate(roi_list) if i != idx):
+                messagebox.showwarning("Uyarı", f"'{new_name}' ismi zaten kullanılıyor!")
+                return
+            roi_list[idx]['name'] = new_name
+            self.current_project['roi_list'] = roi_list
+            try:
+                _save_roi_list_to_db(roi_list)
+                # ML model kaydındaki roi_name'i de güncelle
+                self.cursor.execute(
+                    'UPDATE roi_ml_models SET roi_name=?, updated_date=? WHERE project_id=? AND roi_name=?',
+                    (new_name, datetime.datetime.now().isoformat(),
+                     self.current_project['id'], old_name)
+                )
+                self.conn.commit()
+                # Bellekteki ml_models cache'ini temizle (eski key geçersiz)
+                self.ml_models = {k: v for k, v in self.ml_models.items() if k[1] != old_name}
+            except Exception as e:
+                messagebox.showerror("Hata", f"Kayıt hatası: {e}")
+                return
+            _refresh_roi_lb()
 
         def _delete_roi_from_settings():
             sel = _roi_lb.curselection()
@@ -1717,16 +2280,7 @@ class ProductionMonitoringSystem:
                 rx, ry, rw, rh = rc['coords']
                 self.reference_rois.append(self.reference_image[ry:ry+rh, rx:rx+rw])
             try:
-                roi_json = json.dumps([
-                    {'name': r['name'], 'x': r['coords'][0], 'y': r['coords'][1],
-                     'w': r['coords'][2], 'h': r['coords'][3]}
-                    for r in roi_list
-                ], ensure_ascii=False)
-                self.cursor.execute(
-                    'UPDATE projects SET roi_list=?, updated_date=? WHERE id=?',
-                    (roi_json, datetime.datetime.now().isoformat(), self.current_project['id'])
-                )
-                self.conn.commit()
+                _save_roi_list_to_db(roi_list)
             except Exception as e:
                 messagebox.showerror("Hata", f"ROI kayıt hatası: {e}")
             _refresh_roi_lb()
@@ -1739,11 +2293,215 @@ class ProductionMonitoringSystem:
         ).pack(side='left', fill='x', expand=True, padx=(0, 2))
 
         tk.Button(
+            _roi_btn_row, text="✏ Yeniden Adlandır",
+            bg='#7c3aed', fg='white', font=('Segoe UI', 9, 'bold'),
+            bd=0, padx=6, pady=4,
+            command=_rename_roi_from_settings
+        ).pack(side='left', fill='x', expand=True, padx=(2, 2))
+
+        tk.Button(
             _roi_btn_row, text="✕ Sil",
             bg='#dc2626', fg='white', font=('Segoe UI', 9, 'bold'),
             bd=0, padx=6, pady=4,
             command=_delete_roi_from_settings
         ).pack(side='left', fill='x', expand=True, padx=(2, 0))
+
+        # ── Seçili ROI Ayarları + Veri Toplama + Eğitim ─────────────────────────
+        tk.Frame(left_panel, bg='#1f2937', height=1).pack(fill='x', padx=10, pady=(10, 4))
+        tk.Label(left_panel, text="Seçili ROI — Eğitim & Ayarlar",
+                 font=('Segoe UI', 11, 'bold'), bg='#020617', fg='#e5e7eb').pack(anchor='w', padx=14)
+
+        _roi_sel_frame = tk.Frame(left_panel, bg='#1e293b', bd=1, relief='flat')
+        _roi_sel_frame.pack(fill='x', padx=10, pady=4)
+
+        # Seçili ROI adı
+        _roi_sel_name = tk.Label(_roi_sel_frame, text="— Yukarıdan bir ROI seçin —",
+                                  bg='#1e293b', fg='#94a3b8',
+                                  font=('Segoe UI', 9, 'italic'))
+        _roi_sel_name.pack(anchor='w', padx=8, pady=(6, 2))
+
+        # Görüntü sayacı (OK / NOK)
+        _roi_count_lbl = tk.Label(_roi_sel_frame, text="OK: 0   NOK: 0",
+                                   bg='#1e293b', fg='#6b7280',
+                                   font=('Segoe UI', 9))
+        _roi_count_lbl.pack(anchor='w', padx=8, pady=(0, 4))
+
+        # Görüntü kayıt butonları
+        _capture_row = tk.Frame(_roi_sel_frame, bg='#1e293b')
+        _capture_row.pack(fill='x', padx=8, pady=(0, 6))
+
+        def _count_roi_images(roi_name):
+            """Disk üzerindeki OK/NOK görüntü sayısını döndür."""
+            proj_folder = os.path.join('roi_images', self._safe_name(self.current_project['name']))
+            ok_dir  = os.path.join(proj_folder, self._safe_name(roi_name), 'OK')
+            nok_dir = os.path.join(proj_folder, self._safe_name(roi_name), 'NOK')
+            ok_n  = len([f for f in os.listdir(ok_dir)  if f.lower().endswith(('.jpg','.png'))]) if os.path.isdir(ok_dir)  else 0
+            nok_n = len([f for f in os.listdir(nok_dir) if f.lower().endswith(('.jpg','.png'))]) if os.path.isdir(nok_dir) else 0
+            return ok_n, nok_n
+
+        def _update_count_label():
+            sel = _roi_lb.curselection()
+            if not sel:
+                _roi_count_lbl.config(text="OK: 0   NOK: 0", fg='#6b7280')
+                return
+            roi_list = self.current_project.get('roi_list', [])
+            if sel[0] >= len(roi_list):
+                return
+            roi_name = roi_list[sel[0]]['name']
+            ok_n, nok_n = _count_roi_images(roi_name)
+            color = '#22c55e' if ok_n >= 5 and nok_n >= 5 else '#f59e0b'
+            _roi_count_lbl.config(text=f"OK: {ok_n}   NOK: {nok_n}", fg=color)
+
+        def _save_single_roi_image(label: str):
+            """Sadece seçili ROI'nin görüntüsünü kaydet (OK veya NOK)."""
+            sel = _roi_lb.curselection()
+            if not sel:
+                messagebox.showwarning("Uyarı", "Önce listeden bir ROI seçin!")
+                return
+            roi_list = self.current_project.get('roi_list', [])
+            if sel[0] >= len(roi_list):
+                return
+            rc = roi_list[sel[0]]
+            roi_name = rc['name']
+
+            frame = None
+            source = self.get_camera_source(self.current_project['camera_id'])
+            if source == "HIKROBOT" and self.hik_camera:
+                frame = self.hik_camera.get_frame()
+            else:
+                frame = self._get_latest_frame()
+
+            if frame is None:
+                messagebox.showwarning("Uyarı", "Kamera görüntüsü alınamadı!")
+                return
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h_img, w_img = frame_rgb.shape[:2]
+            x, y, w, h = rc['coords']
+            x = max(0, min(int(x), w_img - 1))
+            y = max(0, min(int(y), h_img - 1))
+            w = max(1, min(int(w), w_img - x))
+            h = max(1, min(int(h), h_img - y))
+            crop = frame_rgb[y:y+h, x:x+w]
+            if crop.size == 0:
+                messagebox.showwarning("Uyarı", "ROI bölgesi geçersiz (boyut 0)!")
+                return
+
+            proj_folder = os.path.join('roi_images', self._safe_name(self.current_project['name']))
+            sub_folder  = os.path.join(proj_folder, self._safe_name(roi_name), label)
+            os.makedirs(sub_folder, exist_ok=True)
+
+            unique = int(datetime.datetime.now().timestamp() * 1000)
+            filename = os.path.join(sub_folder, f"{self._safe_name(roi_name)}_{unique}.jpg")
+            cv2.imwrite(filename, cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+            _update_count_label()
+
+        tk.Button(_capture_row, text="✅ OK Kaydet",
+                  bg='#16a34a', fg='white', font=('Segoe UI', 9, 'bold'),
+                  bd=0, padx=6, pady=5,
+                  command=lambda: _save_single_roi_image('OK')
+                  ).pack(side='left', fill='x', expand=True, padx=(0, 2))
+
+        tk.Button(_capture_row, text="❌ NOK Kaydet",
+                  bg='#dc2626', fg='white', font=('Segoe UI', 9, 'bold'),
+                  bd=0, padx=6, pady=5,
+                  command=lambda: _save_single_roi_image('NOK')
+                  ).pack(side='left', fill='x', expand=True, padx=(2, 0))
+
+        # Algoritma dropdown (per-ROI)
+        _roi_algo_row = tk.Frame(_roi_sel_frame, bg='#1e293b')
+        _roi_algo_row.pack(fill='x', padx=8, pady=2)
+        tk.Label(_roi_algo_row, text="Algoritma:", bg='#1e293b', fg='#e5e7eb',
+                 font=('Segoe UI', 9), width=10, anchor='w').pack(side='left')
+        _roi_algo_var = tk.StringVar()
+        ttk.Combobox(_roi_algo_row,
+                     values=list(self.algo_options_map.keys()),
+                     textvariable=_roi_algo_var,
+                     state='readonly', width=22,
+                     font=('Arial', 9)).pack(side='left', fill='x', expand=True)
+
+        # Eşik (per-ROI)
+        _roi_thresh_row = tk.Frame(_roi_sel_frame, bg='#1e293b')
+        _roi_thresh_row.pack(fill='x', padx=8, pady=2)
+        tk.Label(_roi_thresh_row, text="Eşik:", bg='#1e293b', fg='#e5e7eb',
+                 font=('Segoe UI', 9), width=10, anchor='w').pack(side='left')
+        _roi_thresh_var = tk.DoubleVar(value=0.75)
+        tk.Entry(_roi_thresh_row, textvariable=_roi_thresh_var,
+                 width=8, font=('Arial', 9),
+                 bg='#0f172a', fg='#e5e7eb',
+                 insertbackground='white', relief='flat').pack(side='left')
+
+        # Kaydet + Eğit butonları
+        _roi_cfg_btn_row = tk.Frame(_roi_sel_frame, bg='#1e293b')
+        _roi_cfg_btn_row.pack(fill='x', padx=8, pady=(4, 8))
+
+        def _roi_cfg_save():
+            sel = _roi_lb.curselection()
+            if not sel:
+                messagebox.showwarning("Uyarı", "Önce listeden bir ROI seçin!", parent=self.root)
+                return
+            idx = sel[0]
+            roi_list = self.current_project.get('roi_list', [])
+            if idx >= len(roi_list):
+                return
+            display = _roi_algo_var.get()
+            algo = self.algo_options_map.get(display) if display else None
+            try:
+                thr = float(_roi_thresh_var.get())
+            except ValueError:
+                thr = 0.75
+            roi_list[idx]['algorithm'] = algo
+            roi_list[idx]['threshold'] = thr
+            self.current_project['roi_list'] = roi_list
+            _save_roi_list_to_db(roi_list)
+            messagebox.showinfo("Kaydedildi", f"'{roi_list[idx]['name']}' ROI ayarları kaydedildi.")
+
+        def _roi_train_selected():
+            sel = _roi_lb.curselection()
+            if not sel:
+                messagebox.showwarning("Uyarı", "Önce listeden bir ROI seçin!", parent=self.root)
+                return
+            idx = sel[0]
+            roi_list = self.current_project.get('roi_list', [])
+            if idx >= len(roi_list):
+                return
+            display = _roi_algo_var.get()
+            algo = self.algo_options_map.get(display, 'ML_MODEL') if display else 'ML_MODEL'
+            roi_name = roi_list[idx]['name']
+            self._train_single_roi(roi_name, algo)
+            _update_count_label()
+
+        tk.Button(_roi_cfg_btn_row, text="💾 Ayar Kaydet",
+                  bg='#0ea5e9', fg='white', font=('Segoe UI', 9, 'bold'),
+                  bd=0, padx=6, pady=4,
+                  command=_roi_cfg_save).pack(side='left', fill='x', expand=True, padx=(0, 2))
+
+        tk.Button(_roi_cfg_btn_row, text="🧠 Bu ROI'yi Eğit",
+                  bg='#7c3aed', fg='white', font=('Segoe UI', 9, 'bold'),
+                  bd=0, padx=6, pady=4,
+                  command=_roi_train_selected).pack(side='left', fill='x', expand=True, padx=(2, 0))
+
+        # Listbox seçim → paneli doldur
+        def _on_roi_lb_select(event=None):
+            sel = _roi_lb.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            roi_list = self.current_project.get('roi_list', [])
+            if idx >= len(roi_list):
+                return
+            rc = roi_list[idx]
+            _roi_sel_name.config(text=f"  {rc['name']}", fg='#e5e7eb')
+            roi_algo_internal = rc.get('algorithm') or self.current_project.get('algorithm', 'SSIM')
+            for display_n, internal_n in self.algo_options_map.items():
+                if internal_n == roi_algo_internal:
+                    _roi_algo_var.set(display_n)
+                    break
+            roi_thr = rc.get('threshold') or self.current_project.get('algo_threshold', 0.75)
+            _roi_thresh_var.set(round(float(roi_thr), 4))
+            _update_count_label()
+
+        _roi_lb.bind('<<ListboxSelect>>', _on_roi_lb_select)
 
         # Sağ Panel (Kamera)
         right_panel = ttk.Frame(main_container, style="App.TFrame")
@@ -1780,8 +2538,9 @@ class ProductionMonitoringSystem:
         win.configure(bg="#0f172a")
         win.grab_set()
 
-        # Çalışma kopyası (orijinal değişmeden çalışalım)
-        edit_rois = [{'name': r['name'], 'coords': tuple(r['coords'])}
+        # Çalışma kopyası – per-ROI algorithm/threshold da korunur
+        edit_rois = [{'name': r['name'], 'coords': tuple(r['coords']),
+                      'algorithm': r.get('algorithm'), 'threshold': r.get('threshold')}
                      for r in self.current_project.get('roi_list', [])]
 
         # ── Sol Panel ────────────────────────────────────────────────────────
@@ -1837,7 +2596,8 @@ class ProductionMonitoringSystem:
             try:
                 roi_json = json.dumps([
                     {'name': r['name'], 'x': r['coords'][0], 'y': r['coords'][1],
-                     'w': r['coords'][2], 'h': r['coords'][3]}
+                     'w': r['coords'][2], 'h': r['coords'][3],
+                     'algorithm': r.get('algorithm'), 'threshold': r.get('threshold')}
                     for r in edit_rois
                 ], ensure_ascii=False)
                 first = edit_rois[0]['coords'] if edit_rois else (0, 0, 0, 0)
@@ -2001,40 +2761,43 @@ class ProductionMonitoringSystem:
             self.frame = frame
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Ayarlar sayfasındaki dropdown'dan algoritmayı al
+            # Proje seviyesi varsayılan algoritma ve eşik
             display_name = self.algo_combo_settings.get()
-            algorithm = self.algo_options_map.get(display_name, 'SSIM')
-            
+            proj_algorithm = self.algo_options_map.get(display_name, 'SSIM')
             try:
-                threshold = float(self.threshold_var.get())
+                proj_threshold = float(self.threshold_var.get())
             except ValueError:
-                threshold = 0.75
-            
+                proj_threshold = 0.75
+
             roi_list = self.current_project.get('roi_list', [])
             ref_rois = getattr(self, 'reference_rois', [])
-            
+
             if not roi_list:
                 roi_list = [{'name': 'ROI_1', 'coords': self.current_project['roi']}]
                 ref_rois = [self.reference_roi]
-                
+
             # Tüm ROI'leri işle
             display_frame = frame_rgb.copy()
             overlay = display_frame.copy()
-            
+
             total_score = 0
             passed_count = 0
-            
+
+            ML_ALGOS_VAL = (
+                "ML_MODEL", "ML_MODEL_SIFT", "ML_MODEL_DAISY",
+                "ML_MODEL_HAAR", "ML_MODEL_CENSURE", "ML_MODEL_MBLBP",
+                "ML_MODEL_GLCM", "ML_MODEL_LBP", "ML_MODEL_GABOR", "ML_MODEL_FISHER",
+            )
+
             for idx, rc in enumerate(roi_list):
                 x, y, w, h = rc['coords']
+                # Per-ROI algoritma ve eşik
+                algorithm = rc.get('algorithm') or proj_algorithm
+                threshold = float(rc.get('threshold') or proj_threshold)
                 current_roi = frame_rgb[y:y+h, x:x+w]
                 ref_roi = ref_rois[idx] if idx < len(ref_rois) else self.reference_roi
 
-                if algorithm in (
-                    "ML_MODEL", "ML_MODEL_SIFT", "ML_MODEL_DAISY",
-                    "ML_MODEL_HAAR", "ML_MODEL_CENSURE", "ML_MODEL_MBLBP",
-                    "ML_MODEL_GLCM", "ML_MODEL_LBP", "ML_MODEL_GABOR",
-                    "ML_MODEL_FISHER",
-                ):
+                if algorithm in ML_ALGOS_VAL:
                     # ML modeli ile sınıflandır
                     roi_name = rc.get('name', f"ROI_{idx+1}")
                     model_key = (self.current_project.get('id'), roi_name, algorithm)
@@ -2138,12 +2901,7 @@ class ProductionMonitoringSystem:
                 cv2.rectangle(display_frame, (x, y), (x+w, y+h), color, 2)
                 
                 # Skor / sınıf metni
-                if algorithm in (
-                    "ML_MODEL", "ML_MODEL_SIFT", "ML_MODEL_DAISY",
-                    "ML_MODEL_HAAR", "ML_MODEL_CENSURE", "ML_MODEL_MBLBP",
-                    "ML_MODEL_GLCM", "ML_MODEL_LBP", "ML_MODEL_GABOR",
-                    "ML_MODEL_FISHER",
-                ):
+                if algorithm in ML_ALGOS_VAL:
                     label = f"{rc.get('name', f'ROI_{idx+1}')}: {'OK' if status else 'NOK'}"
                 else:
                     label = f"{rc.get('name', f'ROI_{idx+1}')}: {score:.0%}"
@@ -2151,30 +2909,9 @@ class ProductionMonitoringSystem:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
             cv2.addWeighted(overlay, 0.3, display_frame, 0.7, 0, display_frame)
-            
-            # Genel Durum Geri Bildirimi
-            if algorithm in (
-                "ML_MODEL", "ML_MODEL_SIFT", "ML_MODEL_DAISY",
-                "ML_MODEL_HAAR", "ML_MODEL_CENSURE", "ML_MODEL_MBLBP",
-                "ML_MODEL_GLCM", "ML_MODEL_LBP", "ML_MODEL_GABOR",
-                "ML_MODEL_FISHER",
-            ):
-                algo_lbl = {
-                    "ML_MODEL": "HOG-SVM",
-                    "ML_MODEL_SIFT": "SIFT-SVM",
-                    "ML_MODEL_DAISY": "DAISY-SVM",
-                    "ML_MODEL_HAAR": "HAAR-SVM",
-                    "ML_MODEL_CENSURE": "CENSURE-SVM",
-                    "ML_MODEL_MBLBP": "MBLBP-SVM",
-                    "ML_MODEL_GLCM": "GLCM-SVM",
-                    "ML_MODEL_LBP": "LBP-SVM",
-                    "ML_MODEL_GABOR": "GABOR-SVM",
-                    "ML_MODEL_FISHER": "FISHER-SVM",
-                }.get(algorithm, algorithm)
-                self.score_label.config(text=f"ML({algo_lbl}): {passed_count}/{len(roi_list)} ROI OK")
-            else:
-                avg_score = total_score / len(roi_list) if roi_list else 0
-                self.score_label.config(text=f"Ort. Skor: {avg_score:.2%}")
+
+            # Genel Durum Geri Bildirimi (proje seviyesi algoritma ile özet)
+            self.score_label.config(text=f"{passed_count}/{len(roi_list)} ROI geçti")
             
             all_ok = passed_count == len(roi_list)
             self.result_label.config(
@@ -2186,7 +2923,7 @@ class ProductionMonitoringSystem:
             self.display_monitoring_frame(display_frame)
 
         # Sabit 1 saniyelik döngü – kamera türünden bağımsız
-        self.root.after(1000, self.update_validation)
+        self.root.after(self.monitor_interval, self.update_validation)
     
     def control_screen(self):
         """Kontrol ekranı"""
@@ -2254,6 +2991,7 @@ class ProductionMonitoringSystem:
 
         # roi_list JSON varsa parse et, yoksa eski tek-ROI sütunlarından al
         roi_list_raw = row[7]
+        rois = []
         if roi_list_raw:
             try:
                 rois = json.loads(roi_list_raw)
@@ -2261,99 +2999,307 @@ class ProductionMonitoringSystem:
                 roi_names  = [r.get('name', f'ROI_{i+1}') for i, r in enumerate(rois)]
             except Exception:
                 rois = []
-                roi_tuples = [(row[3], row[4], row[5], row[6])]
-                roi_names  = ['ROI_1']
-        else:
+                roi_tuples = []
+                roi_names  = []
+
+        # JSON boşsa veya parse edilemezse eski tek-ROI sütunlarına düş
+        if not roi_list_raw or not roi_tuples:
             roi_tuples = [(row[3], row[4], row[5], row[6])]
             roi_names  = ['ROI_1']
+            rois = [{}]  # per-ROI alanlar yok
 
         self.current_project = {
             'id': project_id,
             'name': row[0],
             'camera_id': row[1],
             'roi': roi_tuples[0],         # geriye uyumluluk
-            'roi_list': [{'name': roi_names[i], 'coords': roi_tuples[i]}
-                         for i in range(len(roi_tuples))],
+            'roi_list': [
+                {
+                    'name': roi_names[i],
+                    'coords': roi_tuples[i],
+                    'algorithm': rois[i].get('algorithm') if i < len(rois) else None,
+                    'threshold': rois[i].get('threshold') if i < len(rois) else None,
+                }
+                for i in range(len(roi_tuples))
+            ],
             'algorithm': row[8] or 'SSIM',
             'algo_threshold': row[9] if row[9] is not None else 0.75,
         }
 
         # Referans görüntüyü yükle
+        if row[2] is None:
+            raise ValueError("Projede referans görüntü yok. Lütfen projeyi yeniden oluşturun.")
         img_array = np.frombuffer(row[2], dtype=np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Referans görüntü okunamadı (bozuk veri).")
         self.reference_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # İlk ROI'nin referans kesimini oluştur (geriye uyumluluk)
         x, y, w, h = self.current_project['roi']
-        self.reference_roi = self.reference_image[y:y+h, x:x+w]
+        if all(v is not None for v in (x, y, w, h)) and w > 0 and h > 0:
+            self.reference_roi = self.reference_image[y:y+h, x:x+w]
+        else:
+            self.reference_roi = self.reference_image.copy()
 
         # Tüm ROI'lerin referans kesimlerini de oluştur
         self.reference_rois = []
         for rc in self.current_project['roi_list']:
             rx, ry, rw, rh = rc['coords']
-            self.reference_rois.append(self.reference_image[ry:ry+rh, rx:rx+rw])
+            if all(v is not None for v in (rx, ry, rw, rh)) and rw > 0 and rh > 0:
+                self.reference_rois.append(self.reference_image[ry:ry+rh, rx:rx+rw])
+            else:
+                self.reference_rois.append(self.reference_image.copy())
 
 
     
     def start_monitoring(self):
-        """İzlemeyi başlat"""
-        # Kontrol ekranı oluştur
+        """Kontrol ekranı – trigger tabanlı fotoğraf analizi"""
         for widget in self.root.winfo_children():
             widget.destroy()
 
-        monitor_frame = ttk.Frame(self.root, style="App.TFrame")
-        monitor_frame.pack(expand=True, fill='both')
-        
-        # Üst panel
-        top_panel = ttk.Frame(monitor_frame, style="Header.TFrame", height=100)
-        top_panel.pack(fill='x')
-        top_panel.pack_propagate(False)
-        
-        # Proje adı
-        ttk.Label(top_panel, text=f"Proje: {self.current_project['name']}",
-                  style="HeaderTitle.TLabel").pack(pady=10)
-        
-        # Durum
-        self.status_label = tk.Label(top_panel, text="Başlatılıyor...",
-                                     font=('Segoe UI', 14),
-                                     bg='#020617', fg='#e5e7eb')
-        self.status_label.pack()
+        # ── Durum değişkeni ───────────────────────────────────────────────────
+        # 'WAITING' | 'ANALYZING' | 'OK' | 'NOK'
+        self._ctrl_state = 'WAITING'
+        self._trigger_prev = False   # yükselen kenar tespiti için
 
-        # PLC durum göstergesi
-        self.plc_status_label = tk.Label(top_panel, text="PLC: ─",
-                                         font=('Segoe UI', 10),
-                                         bg='#020617', fg='#6b7280')
-        self.plc_status_label.pack()
-        
-        # Durdur butonu
-        stop_btn = ttk.Button(top_panel, text="⏹ Durdur ve Ana Menü", 
-                              command=self.stop_monitoring,
-                              style="Danger.TButton")
-        stop_btn.place(x=10, y=35)
-        
-        # Canvas
-        self.monitor_canvas = tk.Canvas(monitor_frame, bg='black')
-        self.monitor_canvas.pack(expand=True, fill='both', padx=10, pady=10)
-        
-        # İzlemeyi başlat
+        # ── Ana çerçeve ───────────────────────────────────────────────────────
+        main_frame = tk.Frame(self.root, bg='#0f172a')
+        main_frame.pack(expand=True, fill='both')
+
+        # ── Üst başlık ────────────────────────────────────────────────────────
+        header = tk.Frame(main_frame, bg='#020617', height=52)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+
+        tk.Button(header, text="⏹ Durdur",
+                  bg='#dc2626', fg='white',
+                  font=('Segoe UI', 10, 'bold'),
+                  bd=0, padx=14, pady=6,
+                  command=self.stop_monitoring).pack(side='left', padx=10, pady=8)
+
+        tk.Label(header, text=f"Proje: {self.current_project['name']}",
+                 bg='#020617', fg='#e5e7eb',
+                 font=('Segoe UI', 14, 'bold')).pack(side='left', padx=10)
+
+        _plc_on = self.plc.config.get("enabled", False)
+        _plc_init_text = "PLC: Bağlanıyor..." if _plc_on else "PLC: Devre Dışı"
+        _plc_init_fg   = '#f59e0b'            if _plc_on else '#6b7280'
+        self.plc_status_label = tk.Label(header, text=_plc_init_text,
+                                         bg='#020617', fg=_plc_init_fg,
+                                         font=('Segoe UI', 10))
+        self.plc_status_label.pack(side='right', padx=16)
+
+        # ── İçerik: sol (operatör paneli) + sağ (kamera) ─────────────────────
+        content = tk.Frame(main_frame, bg='#0f172a')
+        content.pack(expand=True, fill='both')
+
+        # Sol – Operatör bilgilendirme paneli
+        left = tk.Frame(content, bg='#0f172a', width=320)
+        left.pack(side='left', fill='y', padx=(12, 6), pady=12)
+        left.pack_propagate(False)
+
+        # Büyük durum kutusu
+        self._ctrl_box = tk.Frame(left, bg='#1e3a5f', bd=0, relief='flat')
+        self._ctrl_box.pack(fill='x', pady=(8, 4))
+
+        self._ctrl_icon = tk.Label(self._ctrl_box, text="⏳",
+                                   font=('Segoe UI', 48),
+                                   bg='#1e3a5f', fg='white')
+        self._ctrl_icon.pack(pady=(18, 4))
+
+        self._ctrl_title = tk.Label(self._ctrl_box,
+                                    text="PARÇAYI YERLEŞTİRİN",
+                                    font=('Segoe UI', 16, 'bold'),
+                                    bg='#1e3a5f', fg='white',
+                                    wraplength=280, justify='center')
+        self._ctrl_title.pack(pady=(0, 6))
+
+        self._ctrl_sub = tk.Label(self._ctrl_box,
+                                  text="PLC trigger sinyali bekleniyor...",
+                                  font=('Segoe UI', 10),
+                                  bg='#1e3a5f', fg='#93c5fd',
+                                  wraplength=280, justify='center')
+        self._ctrl_sub.pack(pady=(0, 18))
+
+        # ── Operatör Adım Göstergesi ─────────────────────────────────────────
+        steps_box = tk.Frame(left, bg='#0f172a')
+        steps_box.pack(fill='x', pady=(8, 0))
+
+        _step_cfgs = [
+            (1, "Parçayı yerleştirin"),
+            (2, "Butona basın → kontrol başlar"),
+            (3, "Kontrol sonucunu bekleyin"),
+        ]
+        self._step_labels = {}
+        for sn, stxt in _step_cfgs:
+            sf = tk.Frame(steps_box, bg='#1e293b', bd=0)
+            sf.pack(fill='x', pady=1)
+            num_lbl = tk.Label(sf, text=f" {sn} ", bg='#334155', fg='#94a3b8',
+                               font=('Segoe UI', 10, 'bold'), width=3)
+            num_lbl.pack(side='left')
+            txt_lbl = tk.Label(sf, text=stxt, bg='#1e293b', fg='#64748b',
+                               font=('Segoe UI', 9), anchor='w')
+            txt_lbl.pack(side='left', fill='x', expand=True, padx=8, pady=5)
+            self._step_labels[sn] = (sf, num_lbl, txt_lbl)
+
+        # PLC kapalıyken manuel test butonu
+        if not self.plc.config.get("enabled", False):
+            tk.Label(left, text="PLC bağlı değil – manuel mod",
+                     bg='#0f172a', fg='#f59e0b',
+                     font=('Segoe UI', 9, 'italic')).pack(pady=(8, 0))
+            tk.Button(left, text="📷  Manuel Fotoğraf Çek",
+                      bg='#0ea5e9', fg='white',
+                      font=('Segoe UI', 10, 'bold'),
+                      bd=0, padx=10, pady=8,
+                      command=self._do_capture_and_analyze).pack(
+                          fill='x', pady=(4, 0))
+
+        # ROI sonuç listesi (NOK durumunda kırmızı gösterilir)
+        tk.Label(left, text="ROI Kontrol Listesi",
+                 bg='#0f172a', fg='#9ca3af',
+                 font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(10, 2))
+
+        self._roi_result_frame = tk.Frame(left, bg='#0f172a')
+        self._roi_result_frame.pack(fill='x')
+
+        # ROI satırlarını başlangıçta oluştur
+        self._roi_result_labels = {}
+        for rc in self.current_project.get('roi_list', []):
+            row_f = tk.Frame(self._roi_result_frame, bg='#1e293b')
+            row_f.pack(fill='x', pady=1)
+            dot = tk.Label(row_f, text="●", fg='#6b7280',
+                           bg='#1e293b', font=('Segoe UI', 12))
+            dot.pack(side='left', padx=(8, 4))
+            lbl = tk.Label(row_f, text=rc['name'],
+                           bg='#1e293b', fg='#9ca3af',
+                           font=('Segoe UI', 10), anchor='w')
+            lbl.pack(side='left', fill='x', expand=True, pady=4)
+            stat = tk.Label(row_f, text="─",
+                            bg='#1e293b', fg='#6b7280',
+                            font=('Segoe UI', 10, 'bold'))
+            stat.pack(side='right', padx=8)
+            self._roi_result_labels[rc['name']] = (row_f, dot, lbl, stat)
+
+        # Sağ – Kamera görüntüsü
+        right = tk.Frame(content, bg='#111827')
+        right.pack(side='right', expand=True, fill='both', padx=(6, 12), pady=12)
+
+        self.monitor_canvas = tk.Canvas(right, bg='#111827', highlightthickness=0)
+        self.monitor_canvas.pack(expand=True, fill='both')
+
+        # ── Kamerayı başlat ───────────────────────────────────────────────────
         self.monitoring_active = True
         source = self.get_camera_source(self.current_project['camera_id'])
         if source == "HIKROBOT":
             if not self.hik_camera:
                 self.hik_camera = HikrobotCamera()
-                success, msg = self.hik_camera.open()
-                if not success:
+                ok, msg = self.hik_camera.open()
+                if not ok:
                     messagebox.showerror("Hata", f"Hikrobot Kamera açılamadı: {msg}")
                     return
-            ok = self.hik_camera.start()
-            if not ok:
-                messagebox.showerror("Hata", "Hikrobot Kamera başlatılamadı (StartGrabbing başarısız).")
+            if not self.hik_camera.start():
+                messagebox.showerror("Hata", "Hikrobot Kamera başlatılamadı.")
                 return
         else:
-            # Arka plan thread'i başlat (IP ve USB kamera için ortak)
             self._start_cam_reader(source)
-                
+
+        # Başlangıç durumunu göster (adım göstergesini aktive et)
+        self._set_ctrl_state('WAITING')
+        # Başlangıçta referans görseli göster – canvas render edildikten sonra (200ms)
+        self.root.after(200, self._show_reference_preview)
         self.update_monitoring()
+
+    def _set_ctrl_state(self, state: str, nok_names: list = None, detail: str = ''):
+        """Operatör panelini ve ROI listesini verilen duruma göre güncelle."""
+        if not self.monitoring_active:
+            return
+        if not hasattr(self, '_ctrl_box') or not self._ctrl_box.winfo_exists():
+            return
+        self._ctrl_state = state
+
+        state_cfg = {
+            'WAITING':   ('#1e3a5f', '#93c5fd', '⏳',
+                          'PARÇAYI YERLEŞTİRİN',
+                          'Parçayı doğru konuma yerleştirin, ardından butona basın'),
+            'ANALYZING': ('#78350f', '#fcd34d', '🔍',
+                          'KONTROL EDİLİYOR...',
+                          'Lütfen bekleyin, hareket ettirmeyin'),
+            'OK':        ('#14532d', '#86efac', '✅',
+                          'PARÇA TAMAM  ✓',
+                          'Kaynak işlemi başlatılıyor → Yeni parça için ① adımına dönün'),
+            'NOK':       ('#7f1d1d', '#fca5a5', '❌',
+                          'HATALI / EKSİK PARÇA',
+                          'Kırmızı ROI\'leri kontrol edin → Parçayı düzeltin → Tekrar butona basın'),
+        }.get(state, ('#1e3a5f', '#93c5fd', '⏳', '', ''))
+
+        bg, fg_sub, icon, title, sub = state_cfg
+        if detail:
+            sub = f"{sub}  ({detail})"
+
+        self._ctrl_box.config(bg=bg)
+        self._ctrl_icon.config(text=icon, bg=bg)
+        self._ctrl_title.config(text=title, bg=bg, fg='white')
+        self._ctrl_sub.config(text=sub, bg=bg, fg=fg_sub)
+
+        # Adım göstergelerini güncelle
+        if hasattr(self, '_step_labels'):
+            # Hangi adım aktif?
+            active_step = {
+                'WAITING': 1, 'ANALYZING': 3, 'OK': None, 'NOK': None
+            }.get(state, 1)
+            # WAITING → adım 1 & 2 aktif (parça koy + butona bas)
+            for sn, (sf, num_lbl, txt_lbl) in self._step_labels.items():
+                if state == 'WAITING':
+                    if sn in (1, 2):
+                        sf.config(bg='#1e3a5f')
+                        num_lbl.config(bg='#2563eb', fg='white')
+                        txt_lbl.config(bg='#1e3a5f', fg='#93c5fd')
+                    else:
+                        sf.config(bg='#1e293b')
+                        num_lbl.config(bg='#334155', fg='#94a3b8')
+                        txt_lbl.config(bg='#1e293b', fg='#64748b')
+                elif state == 'ANALYZING':
+                    if sn == 3:
+                        sf.config(bg='#78350f')
+                        num_lbl.config(bg='#b45309', fg='white')
+                        txt_lbl.config(bg='#78350f', fg='#fcd34d')
+                    else:
+                        sf.config(bg='#1e293b')
+                        num_lbl.config(bg='#334155', fg='#94a3b8')
+                        txt_lbl.config(bg='#1e293b', fg='#64748b')
+                elif state == 'OK':
+                    sf.config(bg='#052e16')
+                    num_lbl.config(bg='#166534', fg='white')
+                    txt_lbl.config(bg='#052e16', fg='#86efac')
+                elif state == 'NOK':
+                    if sn in (1, 2):
+                        sf.config(bg='#450a0a')
+                        num_lbl.config(bg='#991b1b', fg='white')
+                        txt_lbl.config(bg='#450a0a', fg='#fca5a5')
+                    else:
+                        sf.config(bg='#1e293b')
+                        num_lbl.config(bg='#334155', fg='#94a3b8')
+                        txt_lbl.config(bg='#1e293b', fg='#64748b')
+
+        # ROI sonuç satırlarını güncelle
+        nok_set = set(nok_names or [])
+        for name, (row_f, dot, lbl, stat) in self._roi_result_labels.items():
+            if state == 'WAITING' or state == 'ANALYZING':
+                row_f.config(bg='#1e293b')
+                dot.config(fg='#6b7280', bg='#1e293b')
+                lbl.config(fg='#9ca3af', bg='#1e293b')
+                stat.config(text='─', fg='#6b7280', bg='#1e293b')
+            elif name in nok_set:
+                row_f.config(bg='#450a0a')
+                dot.config(fg='#ef4444', bg='#450a0a')
+                lbl.config(fg='#fca5a5', bg='#450a0a')
+                stat.config(text='✕ NOK', fg='#ef4444', bg='#450a0a')
+            else:
+                row_f.config(bg='#052e16')
+                dot.config(fg='#22c55e', bg='#052e16')
+                lbl.config(fg='#86efac', bg='#052e16')
+                stat.config(text='✓ OK', fg='#22c55e', bg='#052e16')
     
     def show_roi_preview(self):
         """ROI bölgesini yeni pencerede göster"""
@@ -2810,16 +3756,21 @@ class ProductionMonitoringSystem:
                     summary_lines.append(f"{roi_name}: Yeterli sınıf yok (en az 2 sınıf gerekli).")
                     continue
 
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=0.2, random_state=42, stratify=y
-                )
-
                 kernel = 'rbf' if use_sift else 'linear'
                 svm_model = SVC(kernel=kernel, probability=True)
-                svm_model.fit(X_train, y_train)
 
-                y_pred = svm_model.predict(X_test)
-                acc = float(accuracy_score(y_test, y_pred))
+                min_per_class = min(np.bincount(
+                    np.array([list(np.unique(y)).index(l) for l in y])
+                ))
+                can_split = min_per_class >= 2 and len(X) >= len(np.unique(y)) * 5
+                if can_split:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y, test_size=0.2, random_state=42, stratify=y)
+                    svm_model.fit(X_train, y_train)
+                    acc = float(accuracy_score(y_test, svm_model.predict(X_test)))
+                else:
+                    svm_model.fit(X, y)
+                    acc = float(accuracy_score(y, svm_model.predict(X)))
                 params["accuracy"] = acc
 
                 safe_proj = self._safe_name(project_name)
@@ -2868,6 +3819,173 @@ class ProductionMonitoringSystem:
             messagebox.showinfo("ML Eğitim Sonucu", "\n".join(summary_lines))
         else:
             messagebox.showwarning("ML Eğitim", "Hiç ROI için eğitim yapılamadı.")
+
+    def _train_single_roi(self, roi_name: str, algo_internal: str):
+        """Tek bir ROI için seçili algoritmayı eğit ve DB'ye kaydet."""
+        from sklearn.svm import SVC
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score
+        from sklearn.mixture import GaussianMixture
+
+        if not self.current_project:
+            messagebox.showwarning("Uyarı", "Önce bir proje seçiniz!")
+            return
+
+        ML_ALGOS = (
+            'ML_MODEL', 'ML_MODEL_SIFT', 'ML_MODEL_DAISY',
+            'ML_MODEL_HAAR', 'ML_MODEL_CENSURE', 'ML_MODEL_MBLBP',
+            'ML_MODEL_GLCM', 'ML_MODEL_LBP', 'ML_MODEL_GABOR', 'ML_MODEL_FISHER',
+        )
+        if algo_internal not in ML_ALGOS:
+            messagebox.showwarning("Uyarı",
+                "ROI bazlı eğitim yalnızca ML algoritmaları için geçerlidir.\n"
+                "Seçilen algoritma ML tabanlı değil.")
+            return
+
+        project_name = self.current_project.get('name')
+        project_id   = self.current_project.get('id')
+        safe_proj    = self._safe_name(project_name)
+        safe_roi     = self._safe_name(roi_name)
+
+        roi_folder = os.path.join("roi_images", safe_proj, roi_name)
+        if not os.path.isdir(roi_folder):
+            messagebox.showwarning("Uyarı",
+                f"'{roi_name}' için eğitim veri klasörü bulunamadı:\n{roi_folder}\n\n"
+                "Önce 'ROI Kaydet' ile OK/NOK görüntüleri kaydedin.")
+            return
+
+        images, labels = self._ml_load_images(roi_folder, image_size=(64, 64))
+        if images.size == 0 or labels.size == 0:
+            messagebox.showwarning("Uyarı", f"'{roi_name}': eğitim verisi yok.")
+            return
+
+        if len(np.unique(labels)) < 2:
+            messagebox.showwarning("Uyarı",
+                f"'{roi_name}': En az 2 sınıf (OK + NOK) gerekli.")
+            return
+
+        try:
+            use_sift    = algo_internal == 'ML_MODEL_SIFT'
+            use_daisy   = algo_internal == 'ML_MODEL_DAISY'
+            use_haar    = algo_internal == 'ML_MODEL_HAAR'
+            use_censure = algo_internal == 'ML_MODEL_CENSURE'
+            use_mblbp   = algo_internal == 'ML_MODEL_MBLBP'
+            use_glcm    = algo_internal == 'ML_MODEL_GLCM'
+            use_lbp     = algo_internal == 'ML_MODEL_LBP'
+            use_gabor   = algo_internal == 'ML_MODEL_GABOR'
+            use_fisher  = algo_internal == 'ML_MODEL_FISHER'
+
+            gmm = None
+            if use_sift:
+                X = self._ml_extract_sift_features(images, n_keypoints=50)
+                model_type_str = "SIFT_SVM"; model_suffix = "SIFT_SVM"
+                params = {"kernel": "rbf", "probability": True, "image_size": (64, 64), "sift_n_keypoints": 50}
+            elif use_daisy:
+                X = self._ml_extract_daisy_features(images, step=32, radius=16, rings=2, histograms=6, orientations=8)
+                model_type_str = "DAISY_SVM"; model_suffix = "DAISY_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64)}
+            elif use_haar:
+                X = self._ml_extract_haar_features(images)
+                model_type_str = "HAAR_SVM"; model_suffix = "HAAR_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64)}
+            elif use_censure:
+                X = self._ml_extract_censure_features(images)
+                model_type_str = "CENSURE_SVM"; model_suffix = "CENSURE_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64)}
+            elif use_mblbp:
+                X = self._ml_extract_multiblock_lbp_features(images)
+                model_type_str = "MBLBP_SVM"; model_suffix = "MBLBP_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64)}
+            elif use_glcm:
+                X = self._ml_extract_glcm_features(images)
+                model_type_str = "GLCM_SVM"; model_suffix = "GLCM_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64)}
+            elif use_lbp:
+                X = self._ml_extract_lbp_features(images, radius=3)
+                model_type_str = "LBP_SVM"; model_suffix = "LBP_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64)}
+            elif use_gabor:
+                X = self._ml_extract_gabor_features(images)
+                model_type_str = "GABOR_SVM"; model_suffix = "GABOR_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64)}
+            elif use_fisher:
+                desc_list = self._ml_extract_fisher_features(images, gmm=None, n_components=16, n_keypoints=50)
+                desc_all = [d for d in desc_list if d is not None]
+                if not desc_all:
+                    messagebox.showwarning("Uyarı", f"'{roi_name}': Fisher için ORB descriptor bulunamadı.")
+                    return
+                desc_stack = np.vstack(desc_all)
+                gmm = GaussianMixture(n_components=16, covariance_type='diag', random_state=42)
+                gmm.fit(desc_stack)
+                X = self._ml_extract_fisher_features(images, gmm=gmm, n_components=16, n_keypoints=50)
+                model_type_str = "FISHER_SVM"; model_suffix = "FISHER_SVM"
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64), "fisher_gmm_components": 16}
+            else:
+                X = self._ml_extract_hog_features(images)
+                model_type_str = "HOG_SVM"; model_suffix = ""
+                params = {"kernel": "linear", "probability": True, "image_size": (64, 64),
+                          "hog_pixels_per_cell": (8, 8), "hog_cells_per_block": (2, 2), "hog_orientations": 9}
+
+            kernel = 'rbf' if use_sift else 'linear'
+            svm_model = SVC(kernel=kernel, probability=True)
+
+            # Her sınıftan en az 2 örnek varsa test bölümü yap, yoksa tümüyle eğit
+            n_classes = len(np.unique(labels))
+            min_per_class = min(np.bincount(
+                np.array([list(np.unique(labels)).index(l) for l in labels])
+            ))
+            can_split = min_per_class >= 2 and len(X) >= n_classes * 5
+            if can_split:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, labels, test_size=0.2, random_state=42, stratify=labels)
+                svm_model.fit(X_train, y_train)
+                acc = float(accuracy_score(y_test, svm_model.predict(X_test)))
+            else:
+                # Az veri – tüm set ile eğit, doğruluk eğitim seti üzerinden
+                svm_model.fit(X, labels)
+                acc = float(accuracy_score(labels, svm_model.predict(X)))
+            params["accuracy"] = acc
+
+            model_filename = f"{safe_proj}_{safe_roi}_{model_suffix}.pkl" if model_suffix \
+                else f"{safe_proj}_{safe_roi}.pkl"
+            model_path = os.path.join(roi_folder, model_filename)
+            joblib.dump(svm_model, model_path)
+
+            if use_fisher and gmm is not None:
+                gmm_path = os.path.join(roi_folder, f"{safe_proj}_{safe_roi}_FISHER_GMM.pkl")
+                joblib.dump(gmm, gmm_path)
+                params["gmm_path"] = gmm_path
+
+            now = datetime.datetime.now().isoformat()
+            if project_id is not None:
+                self.cursor.execute('''
+                    INSERT INTO roi_ml_models
+                        (project_id, roi_name, model_type, model_path, params_json, created_date, updated_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, roi_name) DO UPDATE SET
+                        model_type=excluded.model_type,
+                        model_path=excluded.model_path,
+                        params_json=excluded.params_json,
+                        updated_date=excluded.updated_date
+                ''', (project_id, roi_name, model_type_str, model_path, json.dumps(params), now, now))
+                self.conn.commit()
+            # project_id=None → proje henüz kaydedilmedi, model dosya yoluna yazıldı.
+            # Proje kaydedildikten sonra Ayarlar > ROI > Eğit ile DB'ye bağlanabilir.
+
+            # Cache'i temizle – bir sonraki analizde taze yüklensin
+            self.ml_models = {k: v for k, v in self.ml_models.items() if k[1] != roi_name}
+
+            extra = "\n\n⚠ Projeyi kaydedin, ardından Ayarlar'dan tekrar eğitin (DB'ye bağlanacak)." \
+                if project_id is None else ""
+            messagebox.showinfo("Eğitim Tamamlandı",
+                f"'{roi_name}' – [{model_type_str}]\n"
+                f"Doğruluk: {acc:.2%}\n"
+                f"Model: {model_path}{extra}")
+
+        except Exception as exc:
+            import traceback
+            messagebox.showerror("Eğitim Hatası",
+                f"'{roi_name}' eğitimi başarısız:\n{exc}\n\n{traceback.format_exc()}")
 
     def _score_roi(self, current_roi, ref_roi, algorithm):
         """Seçilen algoritmaya göre benzerlik skoru hesapla (0-1)"""
@@ -2962,245 +4080,335 @@ class ProductionMonitoringSystem:
             return 0.0
 
     def update_monitoring(self):
-        """İzleme döngüsü – çoklu ROI + proje algoritması – sabit 1 sn aralık"""
+        """İzleme döngüsü – trigger tabanlı fotoğraf analizi."""
         if not self.monitoring_active:
             return
 
-        frame = None
+        plc_enabled = self.plc.config.get("enabled", False)
+
+        # ── PLC trigger oku ───────────────────────────────────────────────────
+        if plc_enabled:
+            def _read_and_process():
+                ok, trig_val, msg = self.plc.read_trigger()
+                self.root.after(0, lambda: self._on_trigger_read(ok, trig_val, msg))
+            threading.Thread(target=_read_and_process, daemon=True).start()
+        # PLC yokken ekran zaten başlangıçta referans görselle doldurulmuştur.
+
+        # PLC aktifse poll_interval'i kullan (daha hızlı tepki), değilse monitor_interval
+        if plc_enabled:
+            poll_ms = max(50, int(self.plc.config.get("poll_interval", 0.1) * 1000))
+        else:
+            poll_ms = self.monitor_interval
+        self.root.after(poll_ms, self.update_monitoring)
+
+    def _show_reference_preview(self):
+        """Referans görselini ROI kutularıyla canvas'a göster (bekleme ekranı).
+        Kamera okuma YOK – CPU yükü minimumdur."""
+        if not self.monitoring_active:
+            return
+        if self.reference_image is None:
+            return
+        display = self.reference_image.copy()
+
+        roi_list = self.current_project.get('roi_list', [])
+        colors = ['#ef4444', '#3b82f6', '#f97316', '#a855f7',
+                  '#06b6d4', '#ec4899', '#eab308', '#84cc16']
+        for idx, rc in enumerate(roi_list):
+            x, y, w, h = rc['coords']
+            fh, fw = display.shape[:2]
+            x  = max(0, min(x, fw - 1))
+            y  = max(0, min(y, fh - 1))
+            x2 = max(0, min(x + w, fw))
+            y2 = max(0, min(y + h, fh))
+            col_hex = colors[idx % len(colors)]
+            r = int(col_hex[1:3], 16)
+            g = int(col_hex[3:5], 16)
+            b = int(col_hex[5:7], 16)
+            cv2.rectangle(display, (x, y), (x2, y2), (r, g, b), 2)
+            cv2.putText(display, rc.get('name', f'ROI_{idx+1}'),
+                        (x, max(y - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (r, g, b), 2, cv2.LINE_AA)
+
+        self.display_monitoring_frame(display)
+
+    def _on_trigger_read(self, read_ok: bool, trig_val: bool, msg: str):
+        """Trigger okuma sonucunu UI thread'inde işle."""
+        if not self.monitoring_active:
+            return
+
+        if not read_ok:
+            self.plc_status_label.config(text=f"PLC: HATA – {msg}", fg='#f59e0b')
+            self._set_ctrl_state('WAITING')
+            # Hata durumunda referans görseli yeniden göster
+            self._show_reference_preview()
+            return
+
+        trig_str = "▶ 1 (Tetik)" if trig_val else "● 0 (Bekliyor)"
+        self.plc_status_label.config(
+            text=f"PLC: Bağlı  |  {trig_str}",
+            fg='#22c55e' if trig_val else '#6b7280'
+        )
+
+        prev = self._trigger_prev
+        self._trigger_prev = trig_val
+
+        if trig_val and not prev:
+            # ↑ Yükselen kenar: fotoğraf çek + analiz et
+            self._do_capture_and_analyze()
+        elif not trig_val and prev:
+            # ↓ Düşen kenar: PLC sıfırladı → tekrar bekleme ekranı
+            self._set_ctrl_state('WAITING')
+            self._show_reference_preview()
+        # trig_val=0 ve prev=0: zaten bekleme ekranında, tekrar çizmeye gerek yok
+        # trig_val=1 ve prev=1: analiz yapıldı, sonuç ekranda, bekliyoruz
+
+    def _do_capture_and_analyze(self):
+        """Fotoğraf çek ve ROI analizini yap."""
+        if not self.monitoring_active:
+            return
+
+        try:
+            self._do_capture_and_analyze_inner()
+        except Exception as exc:
+            import traceback
+            print(f"[HATA] Analiz sırasında beklenmedik hata:\n{traceback.format_exc()}")
+            try:
+                if self.monitoring_active:
+                    self._set_ctrl_state('WAITING')
+                    self.plc_status_label.config(text=f"Analiz hatası: {exc}", fg='#dc2626')
+            except Exception:
+                pass
+
+    def _do_capture_and_analyze_inner(self):
+        """Fotoğraf çek ve ROI analizini yap (iç mantık)."""
+        # Bekleme durumunu göster
+        self._set_ctrl_state('ANALYZING')
+        self.root.update_idletasks()
+
+        # Kameradan anlık frame al
         source = self.get_camera_source(self.current_project['camera_id'])
         if source == "HIKROBOT" and self.hik_camera:
             frame = self.hik_camera.get_frame()
         else:
-            frame = self._get_latest_frame()  # arka plan reader'dan al
+            frame = self._get_latest_frame()
 
-        # Frame gelmediğinde PLC'yi sıfırla (kamera yok = parça kontrolü yapılamaz)
         if frame is None:
+            if self.monitoring_active:
+                self.plc_status_label.config(text="Kamera görüntüsü yok", fg='#dc2626')
+                self._set_ctrl_state('WAITING')
             if self.plc.config.get("enabled"):
-                def _plc_reset():
-                    ok, msg = self.plc.write_ok_signal(False)
-                    self.root.after(0, lambda: self.plc_status_label.config(
-                        text="PLC: ● 0 (kamera yok)" if ok else f"PLC: HATA – {msg}",
-                        fg='#dc2626' if ok else '#f59e0b'))
-                threading.Thread(target=_plc_reset, daemon=True).start()
-            self.root.after(1000, self.update_monitoring)
+                threading.Thread(
+                    target=self.plc.write_ok_signal, args=(False,), daemon=True
+                ).start()
             return
 
         self.frame = frame
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # ── ROI analizi ───────────────────────────────────────────────────────
+        proj_algorithm = self.current_project.get('algorithm', 'SSIM')
+        proj_threshold = float(self.current_project.get('algo_threshold', 0.75))
+        roi_list  = self.current_project.get('roi_list', [])
+        ref_rois  = getattr(self, 'reference_rois', [])
+
+        if not roi_list:
+            roi_list = [{'name': 'ROI_1', 'coords': self.current_project['roi']}]
+            ref_rois = [self.reference_roi]
+
+        # ROI listesi hâlâ boşsa analiz yapılamaz
+        if not roi_list:
+            if self.monitoring_active:
+                self._set_ctrl_state('WAITING')
+                self.plc_status_label.config(text="ROI tanımlı değil", fg='#f59e0b')
+            return
+
+        results = []   # (passed, score, (x,y,w,h), name, algorithm)
         display_frame = frame_rgb.copy()
-        if frame is not None:  # her zaman True (üstte return ile kontrol edildi)
 
-            algorithm  = self.current_project.get('algorithm', 'SSIM')
-            threshold  = float(self.current_project.get('algo_threshold', 0.75))
-            roi_list   = self.current_project.get('roi_list', [])
-            ref_rois   = getattr(self, 'reference_rois', [])
+        ML_ALGOS = (
+            'ML_MODEL', 'ML_MODEL_SIFT', 'ML_MODEL_DAISY',
+            'ML_MODEL_HAAR', 'ML_MODEL_CENSURE', 'ML_MODEL_MBLBP',
+            'ML_MODEL_GLCM', 'ML_MODEL_LBP', 'ML_MODEL_GABOR', 'ML_MODEL_FISHER',
+        )
 
-            # Geriye uyumluluk: roi_list yoksa tek ROI kullan
-            if not roi_list:
-                roi_list = [{'name': 'ROI_1', 'coords': self.current_project['roi']}]
-                ref_rois = [self.reference_roi]
-
-            results = []   # (passed: bool, score: float, coords, name)
-
-            for idx, rc in enumerate(roi_list):
+        for idx, rc in enumerate(roi_list):
+            try:
                 x, y, w, h = rc['coords']
                 name = rc.get('name', f'ROI_{idx+1}')
-
-                # Görüntüden mevcut ROI kesimi
+                # Per-ROI algoritma ve eşik – tanımlı değilse proje varsayılanı
+                algorithm = rc.get('algorithm') or proj_algorithm
+                threshold = float(rc.get('threshold') or proj_threshold)
                 fh, fw = frame_rgb.shape[:2]
-                x  = max(0, min(x, fw-1))
-                y  = max(0, min(y, fh-1))
-                x2 = max(0, min(x+w, fw))
-                y2 = max(0, min(y+h, fh))
-                current_roi = frame_rgb[y:y2, x:x2]
+                x  = max(0, min(x, fw - 1))
+                y  = max(0, min(y, fh - 1))
+                x2 = max(0, min(x + w, fw))
+                y2 = max(0, min(y + h, fh))
 
-                # Referans ROI
+                # Sıfır boyutlu kesim kontrolü
+                if x2 <= x or y2 <= y:
+                    print(f"[UYARI] {name} ROI geçersiz boyut: ({x},{y})-({x2},{y2})")
+                    results.append((False, 0.0, (x, y, max(1, x2-x), max(1, y2-y)), name, algorithm))
+                    continue
+
+                current_roi = frame_rgb[y:y2, x:x2]
                 ref_roi = ref_rois[idx] if idx < len(ref_rois) else self.reference_roi
 
-                if algorithm in (
-                    'ML_MODEL', 'ML_MODEL_SIFT', 'ML_MODEL_DAISY',
-                    'ML_MODEL_HAAR', 'ML_MODEL_CENSURE', 'ML_MODEL_MBLBP',
-                    'ML_MODEL_GLCM', 'ML_MODEL_LBP', 'ML_MODEL_GABOR',
-                    'ML_MODEL_FISHER',
-                ):
-                    # ML modeli ile sınıflandır
+                if algorithm in ML_ALGOS:
                     model_key = (self.current_project.get('id'), name, algorithm)
                     model = self.ml_models.get(model_key)
                     if model is None:
-                        expected_type = (
-                            "SIFT_SVM" if algorithm == "ML_MODEL_SIFT" else
-                            "DAISY_SVM" if algorithm == "ML_MODEL_DAISY" else
-                            "HAAR_SVM" if algorithm == "ML_MODEL_HAAR" else
-                            "CENSURE_SVM" if algorithm == "ML_MODEL_CENSURE" else
-                            "MBLBP_SVM" if algorithm == "ML_MODEL_MBLBP" else
-                            "GLCM_SVM" if algorithm == "ML_MODEL_GLCM" else
-                            "LBP_SVM" if algorithm == "ML_MODEL_LBP" else
-                            "GABOR_SVM" if algorithm == "ML_MODEL_GABOR" else
-                            "FISHER_SVM" if algorithm == "ML_MODEL_FISHER" else
-                            "HOG_SVM"
-                        )
+                        expected_type = {
+                            'ML_MODEL_SIFT': 'SIFT_SVM', 'ML_MODEL_DAISY': 'DAISY_SVM',
+                            'ML_MODEL_HAAR': 'HAAR_SVM', 'ML_MODEL_CENSURE': 'CENSURE_SVM',
+                            'ML_MODEL_MBLBP': 'MBLBP_SVM', 'ML_MODEL_GLCM': 'GLCM_SVM',
+                            'ML_MODEL_LBP': 'LBP_SVM', 'ML_MODEL_GABOR': 'GABOR_SVM',
+                            'ML_MODEL_FISHER': 'FISHER_SVM',
+                        }.get(algorithm, 'HOG_SVM')
                         self.cursor.execute(
-                            "SELECT model_path, model_type FROM roi_ml_models WHERE project_id = ? AND roi_name = ?",
+                            "SELECT model_path, model_type FROM roi_ml_models "
+                            "WHERE project_id=? AND roi_name=?",
                             (self.current_project.get('id'), name),
                         )
-                        row = self.cursor.fetchone()
-                        if row and row[1] == expected_type and os.path.exists(row[0]):
+                        db_row = self.cursor.fetchone()
+                        if db_row and db_row[1] == expected_type and os.path.exists(db_row[0]):
                             try:
-                                model = joblib.load(row[0])
+                                model = joblib.load(db_row[0])
                                 self.ml_models[model_key] = model
-                            except Exception:
+                            except Exception as e:
+                                print(f"[HATA] Model yüklenemedi ({name}): {e}")
                                 model = None
                     if model is not None:
                         roi_gray = cv2.cvtColor(current_roi, cv2.COLOR_RGB2GRAY)
-                        roi_resized = cv2.resize(roi_gray, (64, 64))
-                        if algorithm == 'ML_MODEL_SIFT':
-                            feat = self._ml_extract_sift_features([roi_resized], n_keypoints=50)
-                        elif algorithm == 'ML_MODEL_DAISY':
-                            feat = self._ml_extract_daisy_features([roi_resized], step=32, radius=16, rings=2, histograms=6, orientations=8)
-                        elif algorithm == 'ML_MODEL_HAAR':
-                            feat = self._ml_extract_haar_features([roi_resized])
-                        elif algorithm == 'ML_MODEL_CENSURE':
-                            feat = self._ml_extract_censure_features([roi_resized])
-                        elif algorithm == 'ML_MODEL_MBLBP':
-                            feat = self._ml_extract_multiblock_lbp_features([roi_resized])
-                        elif algorithm == 'ML_MODEL_GLCM':
-                            feat = self._ml_extract_glcm_features([roi_resized])
-                        elif algorithm == 'ML_MODEL_LBP':
-                            feat = self._ml_extract_lbp_features([roi_resized], radius=3)
-                        elif algorithm == 'ML_MODEL_GABOR':
-                            feat = self._ml_extract_gabor_features([roi_resized])
-                        elif algorithm == 'ML_MODEL_FISHER':
-                            gmm_obj = None
-                            try:
-                                self.cursor.execute(
-                                    "SELECT params_json FROM roi_ml_models WHERE project_id = ? AND roi_name = ?",
-                                    (self.current_project.get('id'), name),
-                                )
-                                prow = self.cursor.fetchone()
-                                if prow and prow[0]:
-                                    p = json.loads(prow[0])
-                                    gmm_path = p.get("gmm_path")
-                                    if gmm_path and os.path.exists(gmm_path):
-                                        gmm_obj = joblib.load(gmm_path)
-                            except Exception:
-                                gmm_obj = None
-                            if gmm_obj is None:
-                                feat = np.zeros((1, 1), dtype=np.float32)
-                            else:
-                                feat = self._ml_extract_fisher_features([roi_resized], gmm=gmm_obj, n_components=16, n_keypoints=50)
-                        else:
-                            from skimage.feature import hog
-                            feat = hog(
-                                roi_resized,
-                                orientations=9,
-                                pixels_per_cell=(8, 8),
-                                cells_per_block=(2, 2),
-                                block_norm='L2-Hys',
-                                visualize=False,
-                            ).reshape(1, -1)
+                        roi_res  = cv2.resize(roi_gray, (64, 64))
+                        feat = self._extract_feat_for_algo(algorithm, roi_res, name)
                         pred = model.predict(feat)[0]
-                        passed = (str(pred).upper() == 'OK')
-                        score = 1.0 if passed else 0.0
+                        passed = str(pred).upper() == 'OK'
+                        score  = 1.0 if passed else 0.0
                     else:
-                        passed = False
-                        score = 0.0
+                        print(f"[UYARI] {name} için model bulunamadı, NOK sayılıyor")
+                        passed, score = False, 0.0
                 else:
-                    score   = self._score_roi(current_roi, ref_roi, algorithm)
-                    passed  = score >= threshold
+                    score  = self._score_roi(current_roi, ref_roi, algorithm)
+                    passed = score >= threshold
 
-                results.append((passed, score, (x, y, x2-x, y2-y), name))
+                results.append((passed, score, (x, y, x2 - x, y2 - y), name, algorithm))
 
-            # ── Her ROI için saydam overlay çiz ──────────────
-            overlay = display_frame.copy()
-            for passed, score, (x, y, w, h), name in results:
-                color = (0, 220, 80) if passed else (220, 40, 40)
+            except Exception as e:
+                print(f"[HATA] ROI '{rc.get('name', idx)}' analiz hatası: {e}")
+                results.append((False, 0.0, (0, 0, 1, 1), rc.get('name', f'ROI_{idx+1}'), proj_algorithm))
 
-                # Saydam dolgu
-                cv2.rectangle(overlay, (x, y), (x+w, y+h), color, -1)
+        # ── Görüntü üzerine overlay çiz ───────────────────────────────────────
+        overlay = display_frame.copy()
+        for passed, score, (x, y, w, h), name, _algo in results:
+            color = (0, 220, 80) if passed else (220, 40, 40)
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
+        cv2.addWeighted(overlay, 0.30, display_frame, 0.70, 0, display_frame)
 
-            cv2.addWeighted(overlay, 0.30, display_frame, 0.70, 0, display_frame)
-
-            for passed, score, (x, y, w, h), name in results:
-                color = (0, 220, 80) if passed else (220, 40, 40)
-
-                # Kenar çizgisi
-                cv2.rectangle(display_frame, (x, y), (x+w, y+h), color, 3)
-
-                # ROI ismi + skor / sınıf
-                if algorithm in (
-                    'ML_MODEL', 'ML_MODEL_SIFT', 'ML_MODEL_DAISY',
-                    'ML_MODEL_HAAR', 'ML_MODEL_CENSURE', 'ML_MODEL_MBLBP',
-                    'ML_MODEL_GLCM', 'ML_MODEL_LBP', 'ML_MODEL_GABOR',
-                    'ML_MODEL_FISHER',
-                ):
-                    label = f"{name}: {'OK' if passed else 'NOK'}"
-                else:
-                    label = f"{name}: {score:.0%}"
-                cv2.putText(display_frame, label, (x, max(y-8, 12)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-
-                if passed:
-                    # ✓ işareti
-                    cx, cy = x + w//2, y + h//2
-                    cv2.drawMarker(display_frame, (cx, cy),
-                                   color, cv2.MARKER_TILTED_CROSS, min(w, h)//2, 4)
-                else:
-                    # X çarpı işareti
-                    m = 12
-                    cv2.line(display_frame, (x+m, y+m), (x+w-m, y+h-m), color, 5)
-                    cv2.line(display_frame, (x+w-m, y+m), (x+m, y+h-m), color, 5)
-
-            # ── Tüm ROI'ler geçti mi? ─────────────────────────
-            # bool(results) kontrolü: ROI yoksa all([]) = True hatasını engeller
-            all_ok   = bool(results) and all(r[0] for r in results)
-            ng_count = sum(1 for r in results if not r[0])
-
-            if all_ok:
-                # Tam ekran yeşil çerçeve
-                fh, fw = display_frame.shape[:2]
-                border = 8
-                cv2.rectangle(display_frame, (border, border),
-                              (fw-border, fh-border), (0, 220, 80), border*2)
-                # Büyük OK yazısı
-                text = "OK"
-                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 5, 8)
-                tx = (fw - tw) // 2
-                ty = (fh + th) // 2
-                cv2.putText(display_frame, text, (tx, ty),
-                            cv2.FONT_HERSHEY_DUPLEX, 5, (0, 220, 80), 8, cv2.LINE_AA)
-                status_text  = f"✓ TÜM ROI'LER TAMAM ({len(results)}/{len(results)})"
-                status_color = '#27ae60'
+        for passed, score, (x, y, w, h), name, _algo in results:
+            color = (0, 220, 80) if passed else (220, 40, 40)
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 3)
+            # Her ROI kendi algoritmasına göre etiketlenir
+            lbl_txt = f"{name}: {'OK' if passed else 'NOK'}" if _algo in ML_ALGOS \
+                else f"{name}: {score:.0%}"
+            cv2.putText(display_frame, lbl_txt, (x, max(y - 8, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+            if passed:
+                cx, cy = x + w // 2, y + h // 2
+                cv2.drawMarker(display_frame, (cx, cy), color,
+                               cv2.MARKER_TILTED_CROSS, min(w, h) // 2, 4)
             else:
-                status_text  = f"✗ {ng_count} ROI HATALI  ({len(results)-ng_count}/{len(results)} geçti)"
-                status_color = '#e74c3c'
+                m = 12
+                cv2.line(display_frame, (x + m, y + m), (x + w - m, y + h - m), color, 5)
+                cv2.line(display_frame, (x + w - m, y + m), (x + m, y + h - m), color, 5)
 
-            self.display_monitoring_frame(display_frame)
-            self.status_label.config(text=status_text, fg=status_color)
+        # ── Sonuç ─────────────────────────────────────────────────────────────
+        all_ok    = bool(results) and all(r[0] for r in results)
+        nok_names = [r[3] for r in results if not r[0]]
 
-            # DB kaydı (ilk ROI skoru veya ML için 1/0)
-            first_score = results[0][1] if results else 0.0
-            self.log_monitoring(first_score, "OK" if all_ok else "FAIL")
+        if all_ok:
+            fh, fw = display_frame.shape[:2]
+            cv2.rectangle(display_frame, (8, 8), (fw - 8, fh - 8), (0, 220, 80), 16)
+            (tw, th), _ = cv2.getTextSize("OK", cv2.FONT_HERSHEY_DUPLEX, 5, 8)
+            cv2.putText(display_frame, "OK",
+                        ((fw - tw) // 2, (fh + th) // 2),
+                        cv2.FONT_HERSHEY_DUPLEX, 5, (0, 220, 80), 8, cv2.LINE_AA)
 
-            # ── PLC sinyal gönder ──────────────────────────────────────────
-            # Tüm ROI OK → DB600.DBX0.0 = 1
-            # Herhangi ROI NOK → DB600.DBX0.0 = 0
-            # Her döngüde canlı olarak yazar
-            if self.plc.config.get("enabled"):
-                def _plc_write(value):
-                    ok, msg = self.plc.write_ok_signal(value)
-                    bit_val = "1" if value else "0"
-                    if ok:
+        if not self.monitoring_active:
+            return  # izleme durduruldu, UI widget'larına dokunma
+
+        self.display_monitoring_frame(display_frame)
+
+        ok_count = len(results) - len(nok_names)
+        self._set_ctrl_state(
+            'OK' if all_ok else 'NOK',
+            nok_names,
+            detail=f"{ok_count}/{len(results)} bölge geçti"
+        )
+
+        # ── DB kaydı ──────────────────────────────────────────────────────────
+        first_score = results[0][1] if results else 0.0
+        self.log_monitoring(first_score, "OK" if all_ok else "FAIL")
+
+        # ── PLC'ye sonuç yaz ──────────────────────────────────────────────────
+        if self.plc.config.get("enabled"):
+            def _plc_write(value):
+                ok, msg = self.plc.write_ok_signal(value)
+                bit_val = "1" if value else "0"
+                color   = '#16a34a' if value else '#dc2626'
+                label   = f"PLC: ● {bit_val}" if ok else f"PLC: HATA – {msg}"
+                fg      = color if ok else '#f59e0b'
+                # Widget yalnızca izleme hâlâ aktifse güncellenir
+                if self.monitoring_active:
+                    try:
                         self.root.after(0, lambda: self.plc_status_label.config(
-                            text=f"PLC: ● {bit_val}",
-                            fg='#16a34a' if value else '#dc2626'))
-                    else:
-                        self.root.after(0, lambda: self.plc_status_label.config(
-                            text=f"PLC: HATA – {msg}",
-                            fg='#f59e0b'))
-                threading.Thread(target=_plc_write, args=(all_ok,), daemon=True).start()
+                            text=label, fg=fg) if self.monitoring_active else None)
+                    except Exception:
+                        pass
+            threading.Thread(target=_plc_write, args=(all_ok,), daemon=True).start()
 
-        # Sabit 1 saniyelik döngü – kamera türünden bağımsız
-        self.root.after(1000, self.update_monitoring)
+    def _extract_feat_for_algo(self, algorithm: str, roi_resized, roi_name: str):
+        """ML algoritmasına göre öznitelik çıkar (tek ROI, tek görüntü)."""
+        if algorithm == 'ML_MODEL_SIFT':
+            return self._ml_extract_sift_features([roi_resized], n_keypoints=50)
+        if algorithm == 'ML_MODEL_DAISY':
+            return self._ml_extract_daisy_features(
+                [roi_resized], step=32, radius=16, rings=2, histograms=6, orientations=8)
+        if algorithm == 'ML_MODEL_HAAR':
+            return self._ml_extract_haar_features([roi_resized])
+        if algorithm == 'ML_MODEL_CENSURE':
+            return self._ml_extract_censure_features([roi_resized])
+        if algorithm == 'ML_MODEL_MBLBP':
+            return self._ml_extract_multiblock_lbp_features([roi_resized])
+        if algorithm == 'ML_MODEL_GLCM':
+            return self._ml_extract_glcm_features([roi_resized])
+        if algorithm == 'ML_MODEL_LBP':
+            return self._ml_extract_lbp_features([roi_resized], radius=3)
+        if algorithm == 'ML_MODEL_GABOR':
+            return self._ml_extract_gabor_features([roi_resized])
+        if algorithm == 'ML_MODEL_FISHER':
+            gmm_obj = None
+            try:
+                self.cursor.execute(
+                    "SELECT params_json FROM roi_ml_models WHERE project_id=? AND roi_name=?",
+                    (self.current_project.get('id'), roi_name),
+                )
+                prow = self.cursor.fetchone()
+                if prow and prow[0]:
+                    p = json.loads(prow[0])
+                    gmm_path = p.get("gmm_path")
+                    if gmm_path and os.path.exists(gmm_path):
+                        gmm_obj = joblib.load(gmm_path)
+            except Exception:
+                pass
+            if gmm_obj is None:
+                return np.zeros((1, 1), dtype=np.float32)
+            return self._ml_extract_fisher_features(
+                [roi_resized], gmm=gmm_obj, n_components=16, n_keypoints=50)
+        # Varsayılan: HOG
+        from skimage.feature import hog
+        return hog(roi_resized, orientations=9, pixels_per_cell=(8, 8),
+                   cells_per_block=(2, 2), block_norm='L2-Hys',
+                   visualize=False).reshape(1, -1)
 
 
     
@@ -3240,18 +4448,23 @@ class ProductionMonitoringSystem:
     
     def display_monitoring_frame(self, frame):
         """İzleme frame'ini göster"""
+        try:
+            if not hasattr(self, 'monitor_canvas') or not self.monitor_canvas.winfo_exists():
+                return
+        except Exception:
+            return
         h, w = frame.shape[:2]
         canvas_w = self.monitor_canvas.winfo_width()
         canvas_h = self.monitor_canvas.winfo_height()
-        
+
         if canvas_w > 1 and canvas_h > 1:
             scale = min(canvas_w/w, canvas_h/h) * 0.95
             new_w, new_h = int(w*scale), int(h*scale)
-            
+
             img_resized = cv2.resize(frame, (new_w, new_h))
             img_pil = Image.fromarray(img_resized)
             self.monitor_photo = ImageTk.PhotoImage(img_pil)
-            
+
             self.monitor_canvas.delete('all')
             x = (canvas_w - new_w) // 2
             y = (canvas_h - new_h) // 2
@@ -3260,18 +4473,20 @@ class ProductionMonitoringSystem:
     def log_monitoring(self, similarity, status):
         """İzleme kaydı tut"""
         try:
+            if self.current_project is None:
+                return
             now = datetime.datetime.now().isoformat()
             self.cursor.execute('''
                 INSERT INTO monitoring_logs (project_id, timestamp, status, similarity_score)
                 VALUES (?, ?, ?, ?)
-            ''', (self.current_project['id'], now, status, similarity))
+            ''', (self.current_project['id'], now, status, float(similarity)))
             self.conn.commit()
         except Exception as e:
-            print(f"Log error: {e}")
+            print(f"[LOG HATA] {e}")
     
     def stop_monitoring(self):
         """İzlemeyi durdur"""
-        self.monitoring_active = False
+        self.monitoring_active = False  # önce kapat – callback'lerin widget'a ulaşmasını önle
         # PLC OK bitini sıfırla (izleme bitti, parça gitti) — thread'de çalıştır
         if self.plc.config.get("enabled"):
             threading.Thread(target=self.plc.write_ok_signal, args=(False,), daemon=True).start()
@@ -3281,7 +4496,11 @@ class ProductionMonitoringSystem:
             self.camera.release()
             self.camera = None
         if self.hik_camera:
-            self.hik_camera.stop()
+            try:
+                self.hik_camera.stop()
+            except Exception:
+                pass
+            self.hik_camera = None   # bir sonraki başlatmada open() yeniden çağrılsın
         self.show_main_menu()
     
     def method_template_matching(self, img_roi, img_ref):
@@ -3473,4 +4692,31 @@ class ProductionMonitoringSystem:
 if __name__ == "__main__":
     root = tk.Tk()
     app = ProductionMonitoringSystem(root)
+
+    def _on_closing():
+        """X butonuna basınca temiz kapat."""
+        app.monitoring_active = False
+        app._stop_cam_reader()
+        if app.hik_camera:
+            try:
+                app.hik_camera.stop()
+            except Exception:
+                pass
+        if app.camera:
+            try:
+                app.camera.release()
+            except Exception:
+                pass
+        if app.plc.connected:
+            try:
+                app.plc.disconnect()
+            except Exception:
+                pass
+        try:
+            app.conn.close()
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_closing)
     root.mainloop()
